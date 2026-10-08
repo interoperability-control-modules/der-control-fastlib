@@ -14,6 +14,7 @@ already uses for its own unit-level #80 test.
 import asyncio
 import inspect
 import json
+import logging
 import time
 from typing import Any
 
@@ -25,6 +26,7 @@ from starlette.websockets import WebSocketState
 
 import derhost.server.fastapi_message_bus as fastapi_message_bus_module
 from derhost.server.connection_manager import ConnectionManager
+from tests.utils import records_from
 
 
 class _StubWebSocket:
@@ -266,7 +268,7 @@ class TestFailedForwardAnswersTheCaller:
         if isinstance(peer_stub, _StubWebSocket) and peer_stub.client_state == WebSocketState.DISCONNECTED:
             assert peer_stub.sent == [], "send_json must never run against a DISCONNECTED peer"
 
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        warnings = records_from(caplog, "derhost.server.connection_manager", logging.WARNING)
         assert len(warnings) == 1
         assert "fwd-m1" in warnings[0].message
         assert (warnings[0].exc_info is not None) == expect_exc_info
@@ -310,7 +312,7 @@ class TestFailedAcceptReleasesTheReservation:
             with pytest.raises(RuntimeError):
                 await manager.connect(failing_ws, identity)
 
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        warnings = records_from(caplog, "derhost.server.connection_manager", logging.WARNING)
         assert len(warnings) == 1
         assert identity in warnings[0].message
         assert warnings[0].exc_info is not None
