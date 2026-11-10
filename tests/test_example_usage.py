@@ -117,8 +117,12 @@ def test_convenience_functions():
 
         # Create connected agent using convenience function
         connected_agent = create_connected_test_agent("my_connected_agent")
-        assert connected_agent.identity == "my_connected_agent"
-        assert connected_agent.connected
+        try:
+            assert connected_agent.identity == "my_connected_agent"
+            assert connected_agent.connected
+        finally:
+            # The manager does not know about agents made by the convenience function.
+            connected_agent.disconnect()
 
 
 def test_connected_agents():
