@@ -742,13 +742,20 @@ class TestOversizeFrameIsReplacedNotQueued:
         assert len(records_from(caplog, CONNECTION_MANAGER_LOGGER, logging.WARNING)) == 1
 
     def test_a_warning_from_an_unrelated_logger_does_not_change_the_replacement_count(self, caplog):
+        noise_message = "Agent left behind reconnection attempt failed"
+
         def unrelated_agent_warns():
-            logging.getLogger("derhost.client.agent").warning("Agent left behind reconnection attempt failed")
+            logging.getLogger("derhost.client.agent").warning(noise_message)
 
         self._run_at_limit_then_over(caplog, between_frames=unrelated_agent_warns)
-        assert len(records_from(caplog, CONNECTION_MANAGER_LOGGER, logging.WARNING)) == 1
-        # The noise reached caplog, so a count across every logger would see two.
-        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+        replaced = records_from(caplog, CONNECTION_MANAGER_LOGGER, logging.WARNING)
+        assert len(replaced) == 1
+        # The noise reached caplog, so a count across both sources would see two.
+        # It is matched by message, so a record from any other stray logger cannot
+        # move this count.
+        noise = [r for r in caplog.records if r.getMessage() == noise_message]
+        assert len(noise) == 1
+        assert len(replaced) + len(noise) == 2
 
 
 class TestOutboxBoundsAtTheBoundary:
