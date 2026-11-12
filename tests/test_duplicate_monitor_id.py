@@ -20,6 +20,7 @@ from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect as ws_connect
 
 from derhost.server.connection_manager import ConnectionManager
+from tests.utils import records_from
 
 
 def _publish(manager, topic: str) -> None:
@@ -124,14 +125,12 @@ class TestDuplicateMonitorIdIsRefused:
                     ws_connect(self.manager.get_monitor_ws_url(monitor_id), open_timeout=5)
                 # The refused handler runs on the server thread after the 409 is sent.
                 time.sleep(0.5)
-            # uvicorn's own logger is out of scope: only the handler's records count.
-            errors = [
-                r.getMessage()
-                for r in caplog.records
-                if r.name.startswith("derhost") and r.levelno >= logging.ERROR
-            ]
+            # Only the server's own records count: uvicorn, and agents earlier tests left
+            # reconnecting, log into the same capture.
+            server_records = records_from(caplog, "derhost.server")
+            errors = [r.getMessage() for r in server_records if r.levelno >= logging.ERROR]
             assert errors == []
-            assert any("refusing new connection" in r.getMessage() for r in caplog.records)
+            assert any("refusing new connection" in r.getMessage() for r in server_records)
         finally:
             first.close()
 

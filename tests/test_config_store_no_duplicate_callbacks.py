@@ -58,7 +58,25 @@ class TestNoDuplicateCallbacks:
         yield bus
         bus.stop()
 
-    def test_set_default_does_not_trigger_callbacks(self, message_bus):
+    @pytest.fixture
+    def make_agent(self, message_bus):
+        """Create agents and disconnect them before the bus stops.
+
+        Agent.stop() leaves the socket open, so an agent still connected when the bus
+        stops would reconnect forever and log into every later test's capture.
+        """
+        agents = []
+
+        def make(identity):
+            agent = create_test_agent(identity)
+            agents.append(agent)
+            return agent
+
+        yield make
+        for agent in agents:
+            agent.disconnect()
+
+    def test_set_default_does_not_trigger_callbacks(self, message_bus, make_agent):
         """
         Verify that set_default() does not trigger any callbacks.
 
@@ -67,7 +85,7 @@ class TestNoDuplicateCallbacks:
         counter = CallbackCounter()
 
         # Create agent (not connected yet)
-        agent = create_test_agent("test_agent_no_callbacks")
+        agent = make_agent("test_agent_no_callbacks")
 
         # Subscribe BEFORE setting defaults
         callback = counter.create_callback("test_callback")
@@ -90,14 +108,14 @@ class TestNoDuplicateCallbacks:
 
         agent.stop()
 
-    def test_single_update_single_callback(self, message_bus):
+    def test_single_update_single_callback(self, message_bus, make_agent):
         """
         Verify that a single config update triggers exactly one callback.
         """
         counter = CallbackCounter()
 
         # Create and connect agent
-        agent = create_test_agent("test_agent_single_callback")
+        agent = make_agent("test_agent_single_callback")
 
         # Subscribe to updates
         callback = counter.create_callback("update_callback")
@@ -121,7 +139,7 @@ class TestNoDuplicateCallbacks:
 
         agent.stop()
 
-    def test_manager_scenario_no_duplicate_greenlets(self, message_bus):
+    def test_manager_scenario_no_duplicate_greenlets(self, message_bus, make_agent):
         """
         Test the Manager agent scenario that was causing duplicate greenlets.
 
@@ -130,7 +148,7 @@ class TestNoDuplicateCallbacks:
         counter = CallbackCounter()
 
         # Create agent like Manager
-        agent = create_test_agent("manager.test")
+        agent = make_agent("manager.test")
 
         # Set up callbacks like Manager does
         def update_default(config_name, action, contents):
@@ -171,7 +189,7 @@ class TestNoDuplicateCallbacks:
 
         agent.stop()
 
-    def test_multiple_agents_no_cross_callbacks(self, message_bus):
+    def test_multiple_agents_no_cross_callbacks(self, message_bus, make_agent):
         """
         Verify that multiple agents don't trigger each other's callbacks.
         """
@@ -179,8 +197,8 @@ class TestNoDuplicateCallbacks:
         counter2 = CallbackCounter()
 
         # Create two agents
-        agent1 = create_test_agent("agent1")
-        agent2 = create_test_agent("agent2")
+        agent1 = make_agent("agent1")
+        agent2 = make_agent("agent2")
 
         # Set up callbacks
         callback1 = counter1.create_callback("agent1_callback")
@@ -205,13 +223,13 @@ class TestNoDuplicateCallbacks:
         agent1.stop()
         agent2.stop()
 
-    def test_rapid_updates_no_duplicates(self, message_bus):
+    def test_rapid_updates_no_duplicates(self, message_bus, make_agent):
         """
         Test that rapid config updates don't cause duplicate callbacks.
         """
         counter = CallbackCounter()
 
-        agent = create_test_agent("rapid_test")
+        agent = make_agent("rapid_test")
         callback = counter.create_callback("rapid_callback")
         agent.vip.config.subscribe(callback, pattern="rapid_config")
 
