@@ -23,10 +23,12 @@ from websockets.sync.client import connect as ws_connect
 
 from derhost.server.connection_manager import ConnectionManager, _MonitorOutbox
 from derhost.server.fastapi_message_bus import FastAPIMessageBus
+from tests.utils import records_from
 
 PAD_32K = "x" * 32768
 PAD_64K = "x" * 65536
 END_TOPIC = "burst/end"
+CONNECTION_MANAGER_LOGGER = "derhost.server.connection_manager"
 
 
 def _frame_text(data: dict) -> str:
@@ -704,12 +706,12 @@ class TestOversizeFrameIsReplacedNotQueued:
 
         with caplog.at_level(logging.WARNING):
             asyncio.run(scenario())
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        warnings = [r.getMessage() for r in records_from(caplog, CONNECTION_MANAGER_LOGGER, logging.WARNING)]
         assert len(warnings) == 1
         for expected in ("'big/topic'", "'agent-x'", str(original_size), str(self.LIMIT)):
             assert expected in warnings[0]
 
-    def test_a_frame_of_exactly_the_limit_arrives_unchanged_and_one_byte_more_is_replaced(self, caplog):
+    def _run_at_limit_then_over(self, caplog, between_frames=None):
         at_limit = self._frame(0)
         at_limit["message"] = "x" * (self.LIMIT - len(_frame_text(at_limit).encode()))
         assert len(_frame_text(at_limit).encode()) == self.LIMIT
@@ -722,6 +724,8 @@ class TestOversizeFrameIsReplacedNotQueued:
             await manager._broadcast_to_monitors(at_limit)
             assert await _wait_until(lambda: len(stub.texts) == 1)
             assert stub.texts[0] == _frame_text(at_limit)
+            if between_frames:
+                between_frames()
             await manager._broadcast_to_monitors(over)
             assert await _wait_until(lambda: len(stub.texts) == 2)
             replaced = json.loads(stub.texts[1])
@@ -732,7 +736,26 @@ class TestOversizeFrameIsReplacedNotQueued:
 
         with caplog.at_level(logging.WARNING):
             asyncio.run(scenario())
-        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+    def test_a_frame_of_exactly_the_limit_arrives_unchanged_and_one_byte_more_is_replaced(self, caplog):
+        self._run_at_limit_then_over(caplog)
+        assert len(records_from(caplog, CONNECTION_MANAGER_LOGGER, logging.WARNING)) == 1
+
+    def test_a_warning_from_an_unrelated_logger_does_not_change_the_replacement_count(self, caplog):
+        noise_message = "Agent left behind reconnection attempt failed"
+
+        def unrelated_agent_warns():
+            logging.getLogger("derhost.client.agent").warning(noise_message)
+
+        self._run_at_limit_then_over(caplog, between_frames=unrelated_agent_warns)
+        replaced = records_from(caplog, CONNECTION_MANAGER_LOGGER, logging.WARNING)
+        assert len(replaced) == 1
+        # The noise reached caplog, so a count across both sources would see two.
+        # It is matched by message, so a record from any other stray logger cannot
+        # move this count.
+        noise = [r for r in caplog.records if r.getMessage() == noise_message]
+        assert len(noise) == 1
+        assert len(replaced) + len(noise) == 2
 
 
 class TestOutboxBoundsAtTheBoundary:

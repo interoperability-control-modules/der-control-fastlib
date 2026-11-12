@@ -2,6 +2,7 @@
 Test utilities for AEMS testing framework.
 """
 
+import logging
 import os
 import shutil
 import socket
@@ -10,6 +11,19 @@ import time
 
 from derhost.client.agent import Agent
 from derhost.server.fastapi_message_bus import FastAPIMessageBus
+
+
+def records_from(caplog, logger_name: str, levelno: int | None = None) -> list[logging.LogRecord]:
+    """Captured records from one logger and its children, optionally at one exact level.
+
+    caplog sees every logger in the process, including agents earlier tests left
+    reconnecting, so a test that counts records must name the logger it is about.
+    """
+    return [
+        r
+        for r in caplog.records
+        if (r.name == logger_name or r.name.startswith(logger_name + ".")) and (levelno is None or r.levelno == levelno)
+    ]
 
 
 def get_random_open_port() -> int:
@@ -40,6 +54,7 @@ class MessageBusManager:
         self.port = None
         self.temp_config_dir = None
         self.host = "127.0.0.1"
+        self.agents: list[Agent] = []
 
     def start_bus(
         self,
@@ -142,6 +157,12 @@ class MessageBusManager:
 
     def stop_bus(self):
         """Stop the message bus and clean up resources."""
+        # Disconnect first: an agent still connected when the bus stops reconnects
+        # forever and logs into every later test's capture.
+        for agent in self.agents:
+            agent.disconnect()
+        self.agents = []
+
         if self.bus and self.bus.is_running():
             self.bus.stop()
             time.sleep(1)
@@ -187,6 +208,7 @@ class MessageBusManager:
 
         # Create agent with test bus connection info
         agent = agent_class(identity=identity, host=self.host, port=self.port, **kwargs)
+        self.agents.append(agent)
 
         return agent
 

@@ -76,9 +76,19 @@ def agent_factory():
 
 @pytest.fixture
 def connected_agent_factory():
-    """Factory function for creating connected test agents."""
+    """Factory function for creating connected test agents.
+
+    Every agent it made is disconnected at teardown: one still connected when the
+    bus stops reconnects forever and logs into every later test's capture.
+    """
+    agents = []
 
     def _create_connected_agent(identity: str, agent_class=None, **kwargs):
-        return create_connected_test_agent(identity, agent_class, **kwargs)
+        agent = create_connected_test_agent(identity, agent_class, **kwargs)
+        agents.append(agent)
+        return agent
 
-    return _create_connected_agent
+    yield _create_connected_agent
+
+    for agent in agents:
+        agent.disconnect()

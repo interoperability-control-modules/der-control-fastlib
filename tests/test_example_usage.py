@@ -117,8 +117,12 @@ def test_convenience_functions():
 
         # Create connected agent using convenience function
         connected_agent = create_connected_test_agent("my_connected_agent")
-        assert connected_agent.identity == "my_connected_agent"
-        assert connected_agent.connected
+        try:
+            assert connected_agent.identity == "my_connected_agent"
+            assert connected_agent.connected
+        finally:
+            # The manager does not know about agents made by the convenience function.
+            connected_agent.disconnect()
 
 
 def test_connected_agents():
@@ -199,16 +203,21 @@ def test_custom_agent_classes():
         assert custom_agent.message_count == 0
 
         # Create another custom agent with convenience function
+        # The manager does not track agents the convenience function makes, so this
+        # one is disconnected here; left connected it would outlive the bus.
         custom_agent2 = create_connected_test_agent(
             "custom_agent2", agent_class=ExampleAgent
         )
-        assert isinstance(custom_agent2, ExampleAgent)
-        assert custom_agent2.connected
+        try:
+            assert isinstance(custom_agent2, ExampleAgent)
+            assert custom_agent2.connected
 
-        # Give time for onstart event to be processed
-        time.sleep(0.1)
+            # Give time for onstart event to be processed
+            time.sleep(0.1)
 
-        assert custom_agent2.test_data == "agent_started"
+            assert custom_agent2.test_data == "agent_started"
+        finally:
+            custom_agent2.disconnect()
 
 
 def test_random_port_fixture(random_port):

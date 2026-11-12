@@ -16,25 +16,31 @@ class TestSingleAgentPerIdentity:
         """Set up test with message bus."""
         self.manager = message_bus_manager_fixture
         self.manager.start_bus()
+        self.agents = []
         yield
+        # An agent the server refused keeps reconnecting after the bus stops, and
+        # logs into every later test's capture, unless it is disconnected here.
+        for agent in self.agents:
+            agent.disconnect()
+
+    def _agent(self, identity):
+        agent = Agent(identity=identity, host=self.manager.host, port=self.manager.port)
+        self.agents.append(agent)
+        return agent
 
     def test_duplicate_identity_rejection(self):
         """Test that server properly rejects duplicate identity connections."""
         identity = "test_agent"
 
         # Create and connect first agent
-        agent1 = Agent(
-            identity=identity, host=self.manager.host, port=self.manager.port
-        )
+        agent1 = self._agent(identity)
         agent1.connect()
         gevent.sleep(0.5)
 
         assert agent1.connected, "First agent should be connected"
 
         # Try to connect second agent with same identity
-        agent2 = Agent(
-            identity=identity, host=self.manager.host, port=self.manager.port
-        )
+        agent2 = self._agent(identity)
 
         # Track if the connection was rejected by the server
         connection_rejected = False
@@ -73,12 +79,8 @@ class TestSingleAgentPerIdentity:
     def test_different_identities_allowed(self):
         """Test that agents with different identities can connect."""
         # Create and connect agents with different identities
-        agent1 = Agent(
-            identity="agent1", host=self.manager.host, port=self.manager.port
-        )
-        agent2 = Agent(
-            identity="agent2", host=self.manager.host, port=self.manager.port
-        )
+        agent1 = self._agent("agent1")
+        agent2 = self._agent("agent2")
 
         agent1.connect()
         agent2.connect()
@@ -97,9 +99,7 @@ class TestSingleAgentPerIdentity:
         identity = "test_agent"
 
         # Connect first agent
-        agent1 = Agent(
-            identity=identity, host=self.manager.host, port=self.manager.port
-        )
+        agent1 = self._agent(identity)
         agent1.connect()
         gevent.sleep(0.5)
         assert agent1.connected, "First agent should be connected"
@@ -110,9 +110,7 @@ class TestSingleAgentPerIdentity:
         assert not agent1.connected, "First agent should be disconnected"
 
         # Connect second agent with same identity - should work now
-        agent2 = Agent(
-            identity=identity, host=self.manager.host, port=self.manager.port
-        )
+        agent2 = self._agent(identity)
         agent2.connect()
         gevent.sleep(0.5)
 
