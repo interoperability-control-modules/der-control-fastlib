@@ -88,11 +88,29 @@ and image tag (`:smoke`) differ from its base file, and the agent joins the
 server's `derhost-smoke-net`. The run is disjoint by name from `stack-up`, so
 it may run while a developer's stack is up. It refuses before building when a
 `derhost-smoke*` object already exists (a killed or concurrent run), and
-`server` or `smoke` in `AGENT_DIRS` is refused before any docker call. Agents
-are built by their own `build.sh`, so `derhost-<dir>:local` and
-`derhost-base:local` are rebuilt or kept; only the `:smoke` tags are removed.
-Each step is bounded by `DERHOST_SMOKE_STEP_TIMEOUT` and
-`DERHOST_SMOKE_WAIT_TIMEOUT`. CI does not build or run containers here, so
+`server` or `smoke` in `AGENT_DIRS` is refused before any docker call, and so
+is an empty `AGENT_DIRS`. Agents are built by their own `build.sh` with the
+overlay, so the `:smoke` image is built directly and `derhost-<dir>:local` is
+never written, retagged or removed. `derhost-base:local` is the exception: each
+agent image builds on it, so a run builds it when it is missing and leaves it
+(and any `:local` image) in place; only the `:smoke` tags are removed.
+
+`INT` and `TERM` run the teardown and end the run with status 130 and 143. A
+teardown step that fails is named, the remaining objects are still counted, and
+the run exits non-zero (with the original status when it had one).
+
+Timeouts, all in seconds and all set through the environment:
+
+- `DERHOST_SMOKE_STEP_TIMEOUT` (120): each compose step and each check.
+- `DERHOST_SMOKE_BUILD_TIMEOUT` (600): each agent's `build.sh`. The server
+  build uses the step timeout.
+- `DERHOST_SMOKE_WAIT_TIMEOUT` (60): the health wait on `up` and the wait for
+  every identity to connect.
+- `DERHOST_SMOKE_RESTART_WINDOW` (10): how long the restarted agent has to
+  show as absent after the stop, and again to reconnect after the start.
+- `DERHOST_SMOKE_POLL_SECS` (1): the pause between checks while waiting.
+
+CI does not build or run containers here, so
 the author runs it locally and pastes its output into the PR. If
 `127.0.0.1` does not answer on the host, publish on another loopback address:
 

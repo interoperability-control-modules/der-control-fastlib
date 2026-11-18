@@ -313,6 +313,10 @@ stack-check: ## GET /connections and confirm EXPECTED (comma-separated) identiti
 
 .PHONY: stack-smoke
 stack-smoke: ## Smoke-test the server and every AGENT_DIRS agent in disjoint derhost-smoke projects
+	@if [ -z "$(strip $(AGENT_DIRS))" ]; then \
+		echo "Error: AGENT_DIRS is empty: a smoke run over no agent proves nothing about them" >&2; \
+		exit 1; \
+	fi
 	@bad="$(filter server smoke,$(AGENT_DIRS))"; \
 	if [ -n "$$bad" ]; then \
 		echo "Error: AGENT_DIRS lists a reserved name ($$bad): it would collide with a server smoke project" >&2; \

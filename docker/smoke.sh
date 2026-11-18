@@ -22,6 +22,7 @@ POLL_SECS="${DERHOST_SMOKE_POLL_SECS:-1}"
 RESTART_WINDOW="${DERHOST_SMOKE_RESTART_WINDOW:-10}"
 RESTART_DIR="realtime-control-agent"
 CLEANED_UP=0
+TEARDOWN_FAILED=()
 BASE_URL=""
 AGENTS=()
 PROJECTS=("$PROJECT_NAME")
@@ -30,8 +31,10 @@ log() {
     printf '[smoke] %s\n' "$1"
 }
 
+# stderr, not stdout: a die inside `$(...)` would otherwise be captured into
+# the caller's variable and never reach the terminal.
 die() {
-    log "error: $1"
+    printf '[smoke] error: %s\n' "$1" >&2
     exit 1
 }
 
@@ -61,6 +64,11 @@ validate_agent_dirs() {
     fi
     if [ -n "${DER_AGENT_SRC:-}" ]; then
         die "DER_AGENT_SRC is set; it would apply to every agent build, unset it"
+    fi
+    # `read -a` takes only the first line, so a newline would silently drop
+    # every name after it and still print "smoke passed".
+    if [[ "$DERHOST_SMOKE_AGENT_DIRS" == *[$'\n\r\t']* ]]; then
+        die "DERHOST_SMOKE_AGENT_DIRS must be one line of space-separated names"
     fi
     local dir seen=" "
     local -a requested
@@ -94,32 +102,36 @@ agent_identity() {
     printf '%s\n' "$identity"
 }
 
-# Prints one line per container, network or volume that carries a smoke
-# project label or a derhost-smoke name. A listing that fails stops the run:
-# an unreadable daemon must not read as "nothing left".
+# Prints "<kind> <id>" per object the listing command (the arguments after
+# the kind) returns. A listing that fails stops the run: an unreadable daemon
+# must not read as "nothing left".
+list_objects() {
+    local kind="$1" out id
+    shift
+    out="$("$@")" || die "cannot list ${kind}s"
+    while IFS= read -r id; do
+        [ -z "$id" ] || printf '%s %s\n' "$kind" "$id"
+    done <<<"$out"
+}
+
+# One line per container, network or volume that carries a smoke project
+# label or a derhost-smoke name. An object matched by both filters prints
+# twice; the caller that counts deduplicates.
 smoke_objects() {
-    local project filter out
+    local project filter
     for project in "${PROJECTS[@]}"; do
         filter="label=com.docker.compose.project=$project"
-        out="$(docker ps -aq --filter "$filter")" || die "cannot list containers"
-        [ -z "$out" ] || printf 'container %s\n' "$out"
-        out="$(docker network ls -q --filter "$filter")" || die "cannot list networks"
-        [ -z "$out" ] || printf 'network %s\n' "$out"
-        out="$(docker volume ls -q --filter "$filter")" || die "cannot list volumes"
-        [ -z "$out" ] || printf 'volume %s\n' "$out"
+        list_objects container docker ps -aq --filter "$filter"
+        list_objects network docker network ls -q --filter "$filter"
+        list_objects volume docker volume ls -q --filter "$filter"
     done
-    out="$(docker ps -aq --filter name=derhost-smoke)" || die "cannot list containers"
-    [ -z "$out" ] || printf 'container %s\n' "$out"
-    out="$(docker network ls -q --filter name=derhost-smoke)" || die "cannot list networks"
-    [ -z "$out" ] || printf 'network %s\n' "$out"
-    out="$(docker volume ls -q --filter name=derhost-smoke)" || die "cannot list volumes"
-    [ -z "$out" ] || printf 'volume %s\n' "$out"
+    list_objects container docker ps -aq --filter name=derhost-smoke
+    list_objects network docker network ls -q --filter name=derhost-smoke
+    list_objects volume docker volume ls -q --filter name=derhost-smoke
 }
 
 smoke_images() {
-    local out
-    out="$(docker image ls -q --filter 'reference=derhost*:smoke')" || die "cannot list images"
-    [ -z "$out" ] || printf 'image %s\n' "$out"
+    list_objects image docker image ls -q --filter 'reference=derhost*:smoke'
 }
 
 refuse_if_leftover_exists() {
@@ -131,7 +143,7 @@ refuse_if_leftover_exists() {
     # exact label for every project this run uses and by name for any other
     # derhost-smoke* object.
     local leftover
-    leftover="$(smoke_objects)"
+    leftover="$(smoke_objects | sort -u)"
     if [ -n "$leftover" ]; then
         log "refusing: a derhost-smoke object already exists (not started by this run)"
         printf '%s\n' "$leftover" | sed 's/^/[smoke]   /'
@@ -139,6 +151,26 @@ refuse_if_leftover_exists() {
     fi
 }
 
+# Runs one teardown step and records its name when it fails, so teardown
+# reports every failed step instead of stopping at the first.
+run_teardown_step() {
+    local name="$1"
+    shift
+    if ! "$@"; then
+        log "teardown step failed: $name"
+        TEARDOWN_FAILED+=("$name")
+    fi
+}
+
+remove_smoke_image() {
+    # An image that is already gone (`down --rmi local` may have taken it)
+    # needs no removal; a daemon that cannot answer shows up in the leftover
+    # listing that follows.
+    docker image inspect "$1" >/dev/null 2>&1 || return 0
+    docker image rm "$1" >/dev/null
+}
+
+# Every step runs even when an earlier one failed. Returns 1 when any failed.
 step_down() {
     local i dir
     log "down"
@@ -150,43 +182,65 @@ step_down() {
         # -v and --rmi local remove the volumes and the untagged images a
         # project built. Safe unconditionally: every name in a smoke project
         # is unique to it, so there is nothing of a developer's stack to reach.
-        agent_compose "$dir" "$STEP_TIMEOUT" down -v --rmi local
+        run_teardown_step "down $dir" agent_compose "$dir" "$STEP_TIMEOUT" down -v --rmi local
     done
-    timeout "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" down -v --rmi local
-    # `--rmi local` skips an image whose service sets `image:`, which every
-    # smoke overlay does, so the :smoke tags are removed by name. Only tags
-    # this run created: build.sh's :local images are not smoke objects.
-    remove_smoke_image "derhost-server:smoke"
+    run_teardown_step "down server" timeout "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" down -v --rmi local
+    # `down --rmi local` removed the server's :smoke image in a live run but
+    # is not relied on for any :smoke tag, so each is removed by name. Only
+    # :smoke tags: a developer's :local images are never smoke objects.
+    run_teardown_step "image rm derhost-server:smoke" remove_smoke_image "derhost-server:smoke"
     for dir in "${AGENTS[@]+"${AGENTS[@]}"}"; do
-        remove_smoke_image "derhost-$dir:smoke"
+        run_teardown_step "image rm derhost-$dir:smoke" remove_smoke_image "derhost-$dir:smoke"
     done
+    [ "${#TEARDOWN_FAILED[@]}" -eq 0 ]
 }
 
-remove_smoke_image() {
-    if docker image inspect "$1" >/dev/null 2>&1; then
-        docker image rm "$1" >/dev/null
-    fi
-}
-
-assert_teardown_clean() {
+# Prints each smoke object still present once, and the count. Returns 1 when
+# any remain or the listing fails.
+report_leftovers() {
     local remaining count
-    remaining="$(smoke_objects; smoke_images)"
+    remaining="$(smoke_objects; smoke_images)" || {
+        log "teardown: cannot list the remaining smoke objects"
+        return 1
+    }
+    remaining="$(printf '%s\n' "$remaining" | awk 'NF' | sort -u)"
     count="$(printf '%s\n' "$remaining" | awk 'NF { n++ } END { print n + 0 }')"
     log "teardown: $count smoke objects remain"
     if [ "$count" -ne 0 ]; then
         printf '%s\n' "$remaining" | sed 's/^/[smoke]   /'
-        die "teardown left $count smoke objects"
+        return 1
     fi
 }
 
+# Down, then the leftover count; the count is printed even when a step failed.
+teardown() {
+    local rc=0
+    step_down || rc=1
+    report_leftovers || rc=1
+    return "$rc"
+}
+
+# The EXIT trap, also reached through `exit` in on_signal. It keeps the
+# original exit status; a teardown failure only turns a would-be 0 into 1.
 cleanup() {
+    local status=$?
+    # A second signal during teardown ends the script by default action; the
+    # next run's leftover check then refuses rather than adopting the objects.
+    trap - INT TERM
     if [ "$CLEANED_UP" -eq 0 ]; then
         CLEANED_UP=1
-        # Best-effort: this runs from the EXIT trap, including after a
-        # failed step, so a teardown failure here must not mask the
-        # original exit status or abort the trap handler itself.
-        step_down || true
+        if ! teardown && [ "$status" -eq 0 ]; then
+            status=1
+        fi
     fi
+    exit "$status"
+}
+
+# Exits instead of returning, so the run does not resume after the trap; the
+# EXIT trap then tears down. bash runs this once the foreground command ends.
+on_signal() {
+    log "caught $1, tearing down"
+    exit "$2"
 }
 
 # Calls stack-check once and leaves its text in CHECK_OUT. Its exit status is
@@ -229,11 +283,11 @@ wait_absent() {
 step_build_and_start_agent() {
     local dir="$1"
     log "build $dir"
-    # build.sh keeps its clean-checkout rule and builds the :local image;
-    # the smoke overlay runs the :smoke tag, so the built image is tagged
-    # rather than the agent's build logic being forked here.
-    timeout "$BUILD_TIMEOUT" bash "$SCRIPT_DIR/$dir/build.sh" || die "build.sh failed for $dir"
-    docker tag "derhost-$dir:local" "derhost-$dir:smoke"
+    # build.sh keeps its clean-checkout rule and git archive; the overlay
+    # makes it build the :smoke image directly, so a smoke run never writes
+    # or retags the developer's :local image.
+    DERHOST_BUILD_OVERLAY="$SCRIPT_DIR/$dir/compose.smoke.yml" timeout "$BUILD_TIMEOUT" bash "$SCRIPT_DIR/$dir/build.sh" ||
+        die "build.sh failed for $dir"
     log "up $dir"
     agent_compose "$dir" "$STEP_TIMEOUT" up -d --no-build --wait --wait-timeout "$WAIT_TIMEOUT"
 }
@@ -292,7 +346,9 @@ main() {
     # above both fail before this line), but a partial failure inside `up`
     # itself (a network or volume created before the container fails to
     # start) must still be cleaned up.
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    trap 'on_signal INT 130' INT
+    trap 'on_signal TERM 143' TERM
     timeout "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" up -d --wait --wait-timeout "$WAIT_TIMEOUT"
 
     log "check"
@@ -313,9 +369,12 @@ main() {
     step_job_probes
     step_restart
 
-    step_down
+    # CLEANED_UP stays 0 until teardown returns, so a signal during it reruns
+    # the (idempotent) teardown from the trap.
+    local teardown_rc=0
+    teardown || teardown_rc=1
     CLEANED_UP=1
-    assert_teardown_clean
+    [ "$teardown_rc" -eq 0 ] || die "teardown did not complete cleanly"
 
     log "smoke passed"
 }

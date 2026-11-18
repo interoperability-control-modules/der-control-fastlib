@@ -14,6 +14,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -59,9 +60,17 @@ downs_logged() {
 # shows it once a `down` has been logged, to model a teardown that leaves
 # an object behind.
 listing() {
+    if [ -n "${STUB_LIST_EXIT-}" ]; then
+        return "$STUB_LIST_EXIT"
+    fi
+    if [ -n "${STUB_LIST_EXIT_AFTER_DOWN-}" ] && downs_logged; then
+        return 1
+    fi
     if [ -n "${STUB_LEFTOVER_PROJECT-}" ] && [[ " $* " == *"com.docker.compose.project=${STUB_LEFTOVER_PROJECT} "* ]]; then
         echo deadbeef0001
     elif [ -n "${STUB_LINGER_PROJECT-}" ] && downs_logged && [[ " $* " == *"com.docker.compose.project=${STUB_LINGER_PROJECT} "* ]]; then
+        echo deadbeef0002
+    elif [ -n "${STUB_LINGER_NAME-}" ] && downs_logged && [[ " $* " == *" name=derhost-smoke "* ]]; then
         echo deadbeef0002
     fi
     return 0
@@ -81,11 +90,18 @@ elif [ "${1-}" = "ps" ] || { [ "${1-}" = "network" ] && [ "${2-}" = "ls" ]; } ||
     listing "$@"
 elif [ "${1-}" = "image" ] && [ "${2-}" = "ls" ]; then
     if [ -n "${STUB_IMAGE_LINGER-}" ] && downs_logged; then echo deadbeef0003; fi
-elif [ "${1-}" = "image" ] && { [ "${2-}" = "inspect" ] || [ "${2-}" = "rm" ]; }; then
+elif [ "${1-}" = "image" ] && [ "${2-}" = "inspect" ]; then
     exit 0
+elif [ "${1-}" = "image" ] && [ "${2-}" = "rm" ]; then
+    exit "${STUB_IMAGE_RM_EXIT:-0}"
 elif [ "${1-}" = "container" ] && [ "${2-}" = "inspect" ]; then
-    # StartedAt moves once per logged `start`, as a real container's does.
-    printf 'T%s\\n' "$(/usr/bin/grep -c 'ARGS: start ' "$STUB_LOG" || true)"
+    # StartedAt moves once per logged `start`, as a real container's does,
+    # unless a test pins it to model a restart that never happened.
+    if [ -n "${STUB_STARTED_AT_FIXED-}" ]; then
+        echo T0
+    else
+        printf 'T%s\\n' "$(/usr/bin/grep -c 'ARGS: start ' "$STUB_LOG" || true)"
+    fi
 elif [ "${1-}" = "tag" ] || [ "${1-}" = "stop" ] || [ "${1-}" = "start" ] || [ "${1-}" = "restart" ]; then
     exit 0
 else
@@ -96,7 +112,16 @@ fi
 
 _BUILD_STUB = """#!/usr/bin/env bash
 set -euo pipefail
-printf 'DERHOST_PUBLISH_HOST=%s DER_AGENT_SRC=%s ARGS: build.sh %s\\n' "${DERHOST_PUBLISH_HOST-unset}" "${DER_AGENT_SRC-unset}" "$(basename "$(dirname "$0")")" >> "$STUB_LOG"
+dir="$(basename "$(dirname "$0")")"
+printf 'DERHOST_PUBLISH_HOST=%s DER_AGENT_SRC=%s DERHOST_BUILD_OVERLAY=%s ARGS: build.sh %s\\n' "${DERHOST_PUBLISH_HOST-unset}" "${DER_AGENT_SRC-unset}" "${DERHOST_BUILD_OVERLAY-unset}" "$dir" >> "$STUB_LOG"
+if [ "${STUB_BUILD_FAIL_DIR-}" = "$dir" ]; then
+    exit 1
+fi
+# Signals the smoke.sh that is running this build, then returns normally: a
+# trap runs once the foreground build ends, so the run must not resume.
+if [ "${STUB_SIGNAL_DIR-}" = "$dir" ]; then
+    kill "-$STUB_SIGNAL" "$(cat "$STUB_SMOKE_PIDFILE")"
+fi
 """
 
 
@@ -134,7 +159,8 @@ class _ConnectionsServer:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - http.server API
                 body = json.dumps({"connections": {i: {} for i in outer.connected()}}).encode()
-                self.send_response(200)
+                status = 500 if outer.fail_after_stop and outer.restart_container_stopped() else 200
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -146,20 +172,28 @@ class _ConnectionsServer:
         self.log_path = log_path
         self.always_connected = always_connected
         self.never_returns = never_returns
+        # Identities the server never reports, and a server that answers 500
+        # while the restarted agent is stopped (an error, not "MISSING").
+        self.hidden: set[str] = set()
+        self.fail_after_stop = False
         self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
-    def connected(self) -> list[str]:
-        identities = list(IDENTITIES.values())
-        events = [
+    def _restart_events(self) -> list[str]:
+        return [
             c[0]
             for c in _stub_calls(self.log_path.read_text())
             if len(c) > 1 and c[0] in ("stop", "start") and c[1] == RESTART_CONTAINER
         ]
+
+    def restart_container_stopped(self) -> bool:
+        events = self._restart_events()
         stopped = bool(events) and events[-1] == "stop"
-        if self.never_returns and "stop" in events:
-            stopped = True
-        if stopped and not self.always_connected:
+        return stopped or (self.never_returns and "stop" in events)
+
+    def connected(self) -> list[str]:
+        identities = [i for i in IDENTITIES.values() if i not in self.hidden]
+        if self.restart_container_stopped() and not self.always_connected and IDENTITIES[RESTART_AGENT] in identities:
             identities.remove(IDENTITIES[RESTART_AGENT])
         return identities
 
@@ -283,9 +317,6 @@ def test_run_order_is_server_then_agents_then_agents_down_before_server(
         up = _index_of(calls, compose("up", project))
         down = _index_of(calls, compose("down", project))
         assert server_up < build < up < down < server_down, (agent, server_up, build, up, down, server_down)
-        # The :smoke tag build.sh's :local image is retagged to is what the overlay runs.
-        assert ["tag", f"derhost-{agent}:local", f"derhost-{agent}:smoke"] in calls
-        assert build < _index_of(calls, lambda c, a=agent: c[:2] == ["tag", f"derhost-{a}:local"]) < up
 
     for call in _compose_calls(calls, "down"):
         assert "-v" in call and _flag_value(call, "--rmi") == "local", call
@@ -330,7 +361,7 @@ def test_restart_fails_when_the_identity_never_goes_absent(
     connections.always_connected = True
     result = _make_smoke(smoke_tree, stub_env)
     assert result.returncode != 0
-    assert "still connected" in result.stdout, result.stdout
+    assert "still connected" in result.stderr, result.stderr
     assert "smoke passed" not in result.stdout
 
 
@@ -340,7 +371,7 @@ def test_restart_fails_when_the_identity_does_not_return_within_the_window(
     connections.never_returns = True
     result = _make_smoke(smoke_tree, stub_env)
     assert result.returncode != 0
-    assert "did not reconnect" in result.stdout, result.stdout
+    assert "did not reconnect" in result.stderr, result.stderr
     assert "smoke passed" not in result.stdout
     # The failure path still tears everything down, agents before the server.
     calls = _log_calls(stub_env)
@@ -447,6 +478,276 @@ def test_publish_host_and_timeouts_reach_the_compose_calls(
     assert all("DERHOST_PUBLISH_HOST=127.0.0.2" in ln for ln in up_lines), up_lines
     server_up = next(c for c in _compose_calls(_log_calls(stub_env), "up") if _flag_value(c, "-p") == "derhost-smoke")
     assert _flag_value(server_up, "--wait-timeout") == "5", server_up
+
+
+# --- a smoke run never writes the developer's :local image (#95). ----------
+
+
+def test_smoke_builds_the_smoke_image_directly_and_never_touches_local(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    log_lines = Path(stub_env["STUB_LOG"]).read_text().splitlines()
+    calls = _log_calls(stub_env)
+    assert not [c for c in calls if c[0] == "tag"], calls
+    assert not [ln for ln in log_lines if ":local" in ln], log_lines
+    build_lines = [ln for ln in log_lines if "ARGS: build.sh" in ln]
+    assert len(build_lines) == len(AGENTS), build_lines
+    for agent in AGENTS:
+        overlay = smoke_tree / "docker" / agent / "compose.smoke.yml"
+        assert any(f"DERHOST_BUILD_OVERLAY={overlay} ARGS: build.sh {agent}" in ln for ln in build_lines), build_lines
+
+
+# --- INT and TERM tear down and end the run (#85 item 1, this script). ------
+
+
+def _smoke_sh(
+    tree: Path, env: dict[str, str], dirs: str, signal_at: tuple[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Runs smoke.sh directly as a process whose pid the build stub can signal."""
+    run_env = {**env, "DERHOST_SMOKE_AGENT_DIRS": dirs, "STUB_SMOKE_PIDFILE": str(tree.parent / "smoke.pid")}
+    if signal_at is not None:
+        run_env["STUB_SIGNAL_DIR"], run_env["STUB_SIGNAL"] = signal_at
+    script = 'echo $$ > "$STUB_SMOKE_PIDFILE"; exec "$0"'
+    return subprocess.run(
+        ["bash", "-c", script, str(tree / "docker" / "smoke.sh")],
+        cwd=tree,
+        env=run_env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def _down_projects(calls: list[list[str]]) -> set[str | None]:
+    return {_flag_value(c, "-p") for c in _compose_calls(calls, "down")}
+
+
+@pytest.mark.parametrize(("signal_name", "status"), [("INT", 130), ("TERM", 143)])
+def test_a_signal_tears_down_and_ends_the_run_with_its_status(
+    smoke_tree: Path,
+    stub_env: dict[str, str],
+    connections: _ConnectionsServer,
+    signal_name: str,
+    status: int,
+) -> None:
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS), signal_at=(AGENTS[0], signal_name))
+    assert result.returncode == status, result.stdout + result.stderr
+    assert "smoke passed" not in result.stdout
+    calls = _log_calls(stub_env)
+    # The run did not resume: the second agent was never built, and no agent was started.
+    assert [c[1] for c in calls if c[0] == "build.sh"] == [AGENTS[0]], calls
+    assert {_flag_value(c, "-p") for c in _compose_calls(calls, "up")} == {"derhost-smoke"}, calls
+    # Teardown ran for every project, and its count was taken.
+    assert _down_projects(calls) == ALL_SMOKE_PROJECTS, calls
+    assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+
+
+# --- a failing teardown is reported on both paths (#95). --------------------
+
+
+_DOWN_STEPS = ("down server", *(f"down {a}" for a in AGENTS))
+
+
+def _assert_teardown_failures_reported(result: subprocess.CompletedProcess[str], steps: tuple[str, ...]) -> None:
+    for step in steps:
+        assert f"[smoke] teardown step failed: {step}\n" in result.stdout, (step, result.stdout)
+    assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+    assert "smoke passed" not in result.stdout
+
+
+def test_a_failing_down_on_the_success_path_is_named_counted_and_fails_the_run(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    stub_env["STUB_DOWN_EXIT"] = "1"
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    _assert_teardown_failures_reported(result, _DOWN_STEPS)
+
+
+def test_a_failing_image_removal_on_the_success_path_is_named_counted_and_fails_the_run(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    stub_env["STUB_IMAGE_RM_EXIT"] = "1"
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    _assert_teardown_failures_reported(
+        result, ("image rm derhost-server:smoke", *(f"image rm derhost-{a}:smoke" for a in AGENTS))
+    )
+
+
+def test_a_failing_down_on_the_failure_path_is_named_and_counted(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    stub_env["STUB_UP_EXIT"] = "1"
+    stub_env["STUB_DOWN_EXIT"] = "1"
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    _assert_teardown_failures_reported(result, _DOWN_STEPS)
+
+
+def test_a_failing_teardown_keeps_the_original_exit_status(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    stub_env["STUB_DOWN_EXIT"] = "1"
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS), signal_at=(AGENTS[0], "TERM"))
+    assert result.returncode == 143, result.stdout + result.stderr
+    _assert_teardown_failures_reported(result, _DOWN_STEPS)
+
+
+def test_a_teardown_that_cannot_list_objects_fails_closed_and_says_so(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    # The listing works for the refusal check and fails once `down` has run.
+    stub_env["STUB_LIST_EXIT_AFTER_DOWN"] = "1"
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    assert "teardown: cannot list the remaining smoke objects" in result.stdout, result.stdout
+    assert "smoke passed" not in result.stdout
+
+
+# --- the checks that were unprotected at ba4335a (#95). ----------------------
+
+
+def test_the_run_fails_when_an_agent_identity_never_connects(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    connections.hidden = {IDENTITIES[AGENTS[0]]}
+    stub_env["DERHOST_SMOKE_WAIT_TIMEOUT"] = "2"
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    assert "not every identity connected within 2s" in result.stderr, result.stderr
+    assert "smoke passed" not in result.stdout
+    # It stops before the restart step touches any container.
+    assert not [c for c in _log_calls(stub_env) if c[0] in ("stop", "start")]
+
+
+def test_the_run_fails_when_the_restart_leaves_started_at_unchanged(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    stub_env["STUB_STARTED_AT_FIXED"] = "1"
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    assert f"{RESTART_CONTAINER} StartedAt did not change (T0)" in result.stderr, result.stderr
+    assert "StartedAt changed" not in result.stdout
+    assert "smoke passed" not in result.stdout
+
+
+def test_an_error_after_the_stop_is_not_taken_for_the_identity_being_absent(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    connections.fail_after_stop = True
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    assert "der.rtc: MISSING" not in result.stdout
+    assert "is still connected after" in result.stderr, result.stderr
+    # The container is never started: the wait for MISSING is what gates it.
+    assert not [c for c in _log_calls(stub_env) if c[0] == "start"], _log_calls(stub_env)
+    assert "smoke passed" not in result.stdout
+
+
+@pytest.mark.parametrize("failing", AGENTS)
+def test_a_failing_build_sh_stops_before_that_agent_or_a_later_one_starts(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer, failing: str
+) -> None:
+    stub_env["STUB_BUILD_FAIL_DIR"] = failing
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    assert f"build.sh failed for {failing}" in result.stderr, result.stderr
+    calls = _log_calls(stub_env)
+    started = {_flag_value(c, "-p") for c in _compose_calls(calls, "up")}
+    assert f"derhost-smoke-{failing}" not in started, calls
+    built = [c[1] for c in calls if c[0] == "build.sh"]
+    assert built == list(AGENTS[: AGENTS.index(failing) + 1]), built
+    assert "smoke passed" not in result.stdout
+    assert _down_projects(calls) == ALL_SMOKE_PROJECTS, calls
+
+
+def test_each_smoke_image_is_removed_once_by_name_and_no_local_image_is(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    removed = sorted(c[2] for c in _log_calls(stub_env) if c[:2] == ["image", "rm"])
+    assert removed == sorted(["derhost-server:smoke", *(f"derhost-{a}:smoke" for a in AGENTS)]), removed
+
+
+def test_an_empty_agent_list_runs_the_server_alone_through_to_a_pass(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    result = _smoke_sh(smoke_tree, stub_env, "")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "smoke passed" in result.stdout
+    assert f"restart: {RESTART_AGENT} is not in AGENT_DIRS, skipped" in result.stdout, result.stdout
+    assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+    calls = _log_calls(stub_env)
+    assert {_flag_value(c, "-p") for c in calls if c[0] == "compose"} == {"derhost-smoke"}, calls
+    assert not [c for c in calls if c[0] in ("build.sh", "stop", "start")], calls
+
+
+# --- small fixes: stderr from a die in `$(...)`, input refusals, the count. --
+
+
+def test_a_die_inside_a_command_substitution_reaches_stderr(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    dockerfile = smoke_tree / "docker" / AGENTS[0] / "Dockerfile"
+    dockerfile.write_text(dockerfile.read_text().replace('"--identity"', '"--identit"'), encoding="utf-8")
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    assert f"docker/{AGENTS[0]}/Dockerfile passes no --identity" in result.stderr, result.stderr
+
+
+def test_a_listing_that_fails_is_reported_on_stderr(smoke_tree: Path, stub_env: dict[str, str]) -> None:
+    stub_env["STUB_LIST_EXIT"] = "1"
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    assert "cannot list containers" in result.stderr, result.stderr
+    assert not _compose_calls(_log_calls(stub_env), "up")
+
+
+def test_a_newline_in_the_agent_list_is_refused_before_any_docker_call(
+    smoke_tree: Path, stub_env: dict[str, str]
+) -> None:
+    result = _smoke_sh(smoke_tree, stub_env, f"{AGENTS[0]}\n{AGENTS[1]}")
+    assert result.returncode != 0
+    assert "must be one line of space-separated names" in result.stderr, result.stderr
+    assert Path(stub_env["STUB_LOG"]).read_text() == ""
+
+
+@pytest.mark.parametrize("empty", ["", " "])
+def test_make_refuses_an_empty_agent_dirs_before_any_docker_call(
+    smoke_tree: Path, stub_env: dict[str, str], empty: str
+) -> None:
+    result = _make_smoke(smoke_tree, stub_env, f"AGENT_DIRS={empty}")
+    assert result.returncode != 0
+    assert "AGENT_DIRS is empty" in result.stderr, result.stderr
+    assert Path(stub_env["STUB_LOG"]).read_text() == ""
+
+
+def test_the_leftover_count_counts_an_object_matched_by_two_filters_once(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    # One lingering object per kind (container, network, volume), listed by
+    # the project label and again by the name filter: 3 objects, not 6.
+    stub_env["STUB_LINGER_PROJECT"] = "derhost-smoke"
+    stub_env["STUB_LINGER_NAME"] = "1"
+    result = _make_smoke(smoke_tree, stub_env)
+    assert result.returncode != 0
+    assert "teardown: 3 smoke objects remain" in result.stdout, result.stdout
+
+
+def test_the_readme_names_every_smoke_timeout_and_the_local_images_it_keeps() -> None:
+    smoke_sh = (DOCKER_DIR / "smoke.sh").read_text(encoding="utf-8")
+    readme = (DOCKER_DIR / "README.md").read_text(encoding="utf-8")
+    knobs = sorted(set(re.findall(r"\$\{(DERHOST_SMOKE_[A-Z_]+):-", smoke_sh)))
+    # Not vacuous: the four timeouts, the restart window and the poll interval.
+    assert len(knobs) == 5, knobs
+    for knob in knobs:
+        assert knob in readme, knob
+    assert "derhost-base:local" in readme
 
 
 # --- merged configs share no object name with the base stack. --------------
