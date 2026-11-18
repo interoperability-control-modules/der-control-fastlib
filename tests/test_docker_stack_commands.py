@@ -673,17 +673,20 @@ def test_stack_up_passes_server_project_name(docker_stub: Path, monkeypatch: pyt
 #
 # AGENT_DIRS is empty at this PR (#68), so these tests add one entry on the
 # `make` command line, standing in for the per-agent PR that will list a real
-# directory; the directory itself need not hold a compose file, since the
-# stub `docker` never reads one.
+# directory; the directory holds only the build.sh stack-up runs before it
+# starts an agent, since the stub `docker` never reads a compose file.
 
 
 @pytest.fixture
 def agent_fixture_dir() -> Iterator[Path]:
     path = REPO_ROOT / "docker" / "agent-fixture"
     path.mkdir()
+    build_sh = path / "build.sh"
+    build_sh.write_text("#!/usr/bin/env bash\nexit 0\n")
     try:
         yield path
     finally:
+        build_sh.unlink()
         path.rmdir()
 
 

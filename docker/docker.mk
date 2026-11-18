@@ -67,7 +67,10 @@ pass-through = $(if $(filter-out undefined,$($(1)_ORIGIN)),$(1)=$(call shell-saf
 # agent's own compose calls below pass -p derhost-<dir>, the same pinning
 # the server project already has, so an exported COMPOSE_PROJECT_NAME
 # cannot retarget an agent's stack-up/down/status the way it could the
-# server's before that fix.
+# server's before that fix. Every agent compose call sets
+# DER_AGENT_SRC=unused, because a compose file needs it to load at all;
+# stack-up builds through each agent's own build.sh (check-clean and git
+# archive included) first, then starts it with --no-build.
 AGENT_DIRS := interoperability-service realtime-control-agent
 
 override OTHER_COMPOSE_FILES := $(foreach d,$(AGENT_DIRS),$(DOCKER_DIR)/$(d)/docker-compose.yml)
@@ -257,7 +260,10 @@ stack-up: ## Start the stack: C=server or C=all (server first, then any other do
 	if [ "$$c" = "all" ]; then \
 		for f in $$OTHER_COMPOSE_FILES; do \
 			dir=$$(dirname "$$f"); \
-			docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" up -d --build; \
+			name=$$(basename "$$dir"); \
+			bash "$$dir/build.sh" || { echo "Error: build.sh failed for $$name" >&2; exit 1; }; \
+			DER_AGENT_SRC=unused docker compose -p "derhost-$$name" -f "$$f" --project-directory "$$dir" up -d --no-build \
+				|| { echo "Error: starting $$name failed" >&2; exit 1; }; \
 		done; \
 	fi
 
@@ -265,7 +271,7 @@ stack-up: ## Start the stack: C=server or C=all (server first, then any other do
 stack-down: ## Stop the stack (any other docker/*/docker-compose.yml, then the server)
 	@for f in $$OTHER_COMPOSE_FILES; do \
 		dir=$$(dirname "$$f"); \
-		docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" down || true; \
+		DER_AGENT_SRC=unused docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" down || true; \
 	done
 	-docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) down
 
@@ -274,7 +280,7 @@ stack-status: ## Show status of the derhost stack
 	-docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) ps
 	@for f in $$OTHER_COMPOSE_FILES; do \
 		dir=$$(dirname "$$f"); \
-		docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" ps || true; \
+		DER_AGENT_SRC=unused docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" ps || true; \
 	done
 
 .PHONY: stack-check
