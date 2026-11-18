@@ -29,6 +29,6 @@ LABEL org.opencontainers.image.revision=${AGENT_REVISION}
 USER derhost
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python3", "-c", "import os,sys; sys.exit(0 if any(b'start-legacy.py' in open(f'/proc/{p}/cmdline','rb').read() for p in os.listdir('/proc') if p.isdigit()) else 1)"]
+    CMD ["python3", "-c", "import sys; sys.exit(0 if b'start-legacy.py' in open('/proc/1/cmdline','rb').read() else 1)"]
 
 CMD ["python3", "/app/start-legacy.py", "--agent-dir", "/agent", "--module", "interoperability.agent", "--identity", "platform.presentation"]
