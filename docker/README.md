@@ -42,6 +42,8 @@ Run from the repository root.
   agent `down` does not stop the rest; the command exits non-zero at the end
   naming each agent whose `down` failed.
 - `make stack-status` - `docker compose ps` for each stack.
+- `make stack-smoke` - smoke-test the server and every `AGENT_DIRS` agent in
+  their own `derhost-smoke` projects (see "Smoke test").
 - `make stack-check` - `GET /connections` from the host and confirm the
   identities in `EXPECTED` (comma-separated) are connected; `EXPECTED=`
   (the default) trivially passes.
@@ -74,17 +76,26 @@ environment; an environment value always wins over the `.env` file.
 
 ## Smoke test
 
-`docker/smoke.sh` runs `config -q`, `build`, `up --wait`, `stack-check` and
-`down` against `docker/server`, each step bounded with `timeout`, and always
-brings the stack down on exit. It runs in its own compose project
-(`derhost-smoke`, `docker/server/compose.smoke.yml`), disjoint by name from
-the `stack-up` project, so it may run while a developer's stack is up; it
-refuses only when a leftover `derhost-smoke` object already exists (a killed
-or concurrent run). Its published port is ephemeral, so port 5410 does not
-matter to it; `DERHOST_PUBLISH_HOST` still selects the loopback address. CI
-does not build or run containers here, so the author runs this locally and
-pastes its output into the PR:
+`make stack-smoke` runs `docker/smoke.sh` over the server and every directory
+in `AGENT_DIRS`. It proves the server is healthy, each agent registers its
+identity (`platform.presentation`, `der.rtc`), the `der.rtc` agent leaves and
+rejoins within 10 s of a stop and start with a new `StartedAt`, and nothing
+labelled or named `derhost-smoke` is left afterwards (the count is printed).
+Job probes are not part of it yet.
+
+Each agent directory has a `compose.smoke.yml` overlay: project, container
+and image tag (`:smoke`) differ from its base file, and the agent joins the
+server's `derhost-smoke-net`. The run is disjoint by name from `stack-up`, so
+it may run while a developer's stack is up. It refuses before building when a
+`derhost-smoke*` object already exists (a killed or concurrent run), and
+`server` or `smoke` in `AGENT_DIRS` is refused before any docker call. Agents
+are built by their own `build.sh`, so `derhost-<dir>:local` and
+`derhost-base:local` are rebuilt or kept; only the `:smoke` tags are removed.
+Each step is bounded by `DERHOST_SMOKE_STEP_TIMEOUT` and
+`DERHOST_SMOKE_WAIT_TIMEOUT`. CI does not build or run containers here, so
+the author runs it locally and pastes its output into the PR. If
+`127.0.0.1` does not answer on the host, publish on another loopback address:
 
 ```
-DERHOST_PUBLISH_HOST=127.0.0.2 docker/smoke.sh
+DERHOST_PUBLISH_HOST=127.0.0.2 make stack-smoke
 ```
