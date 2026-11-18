@@ -1,0 +1,14 @@
+# Overlay docker/smoke.sh applies on top of docker-compose.yml (#95): every
+# name below differs from the base file, and the network is the server smoke
+# project's own, so a smoke run never touches a developer's stack-up objects.
+name: derhost-smoke-realtime-control-agent
+
+services:
+  derhost-realtime-control-agent:
+    image: derhost-realtime-control-agent:smoke
+    container_name: derhost-smoke-realtime-control-agent
+
+networks:
+  derhost-net:
+    name: derhost-smoke-net
+    external: true

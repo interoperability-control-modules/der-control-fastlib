@@ -28,9 +28,26 @@ def discover_compose_files() -> list[Path]:
     return sorted(DOCKER_DIR.glob("*/docker-compose.yml"))
 
 
+class _ComposeLoader(yaml.SafeLoader):
+    """SafeLoader that reads compose's `!override` and `!reset` merge tags as
+    the plain value they wrap, since an overlay file may carry them."""
+
+
+def _construct_merge_tag(loader: _ComposeLoader, node: yaml.Node) -> Any:
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node, deep=True)
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node, deep=True)
+    return loader.construct_scalar(node)  # type: ignore[arg-type]
+
+
+_ComposeLoader.add_constructor("!override", _construct_merge_tag)
+_ComposeLoader.add_constructor("!reset", _construct_merge_tag)
+
+
 def load_compose(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+        return yaml.load(handle, Loader=_ComposeLoader)  # noqa: S506 - SafeLoader subclass
 
 
 def _env_mapping(service: dict[str, Any]) -> dict[str, str]:
@@ -454,3 +471,128 @@ def test_agent_mutant_m11_is_rejected() -> None:
         check_cap_drop_all("derhost-some-agent", service)
     with pytest.raises(AssertionError, match="external"):
         check_network_declaration(path, compose)
+
+
+# --- Rule 12: smoke overlays (#95) are held to the hardening rules too. -----
+#
+# An overlay is partial by design (it inherits user, cap_drop and the rest
+# from its base file), so only the rules that forbid a setting apply to it,
+# plus the naming rules that keep a smoke run disjoint from a developer's
+# stack-up objects.
+
+SMOKE_NETWORK = "derhost-smoke-net"
+SERVER_OVERLAY_PORTS = ["${DERHOST_PUBLISH_HOST:-127.0.0.1}::8000"]
+_FORBIDDING_RULES = (
+    check_no_docker_socket,
+    check_no_var_run_mount,
+    check_no_cap_add,
+    check_not_privileged,
+    check_no_host_namespace,
+    check_no_env_file,
+    check_no_secret_env,
+)
+
+
+def discover_overlay_files() -> list[Path]:
+    """Every docker/<name>/compose.smoke.yml under the repo root."""
+    return sorted(DOCKER_DIR.glob("*/compose.smoke.yml"))
+
+
+def check_overlay(path: Path, compose: dict[str, Any]) -> None:
+    directory = path.parent.name
+    is_server = directory == "server"
+    for name, service in compose.get("services", {}).items():
+        for rule in _FORBIDDING_RULES:
+            rule(name, service)
+        expected_container = "derhost-smoke-server" if is_server else f"derhost-smoke-{directory}"
+        if service.get("container_name") != expected_container:
+            raise AssertionError(
+                f"{path}: expected container_name: {expected_container}, got {service.get('container_name')!r}"
+            )
+        if not str(service.get("image", "")).endswith(":smoke"):
+            raise AssertionError(f"{path}: image must carry the :smoke tag, got {service.get('image')!r}")
+        if is_server:
+            if service.get("ports") != SERVER_OVERLAY_PORTS:
+                raise AssertionError(
+                    f"{name}: expected ports == {SERVER_OVERLAY_PORTS!r}, got {service.get('ports')!r}"
+                )
+        elif "ports" in service:
+            raise AssertionError(f"{name}: publishes a port; only {SERVER_SERVICE} may")
+    if not is_server and compose.get("name") != f"derhost-smoke-{directory}":
+        raise AssertionError(f"{path}: expected name: derhost-smoke-{directory}, got {compose.get('name')!r}")
+    network = (compose.get("networks") or {}).get("derhost-net") or {}
+    if network.get("name") != SMOKE_NETWORK:
+        raise AssertionError(f"{path}: derhost-net must be renamed to {SMOKE_NETWORK}, got {network.get('name')!r}")
+    if not is_server and not network.get("external"):
+        raise AssertionError(f"{path}: derhost-net must stay external: true outside the server overlay")
+    if is_server and network.get("external"):
+        raise AssertionError(f"{path}: the server overlay owns {SMOKE_NETWORK}; it must not be external")
+
+
+def test_every_agent_has_a_smoke_overlay_and_the_rules_hold_on_each() -> None:
+    overlays = discover_overlay_files()
+    # Not vacuous: the server's overlay plus one per agent directory.
+    assert [p.parent.name for p in overlays] == ["interoperability-service", "realtime-control-agent", "server"], (
+        overlays
+    )
+    for path in overlays:
+        check_overlay(path, load_compose(path))
+
+
+def test_overlay_loader_reads_the_override_tag_as_its_plain_value() -> None:
+    compose = load_compose(DOCKER_DIR / "server" / "compose.smoke.yml")
+    assert compose["services"][SERVER_SERVICE]["ports"] == SERVER_OVERLAY_PORTS
+
+
+def _agent_overlay_text() -> str:
+    return (DOCKER_DIR / "realtime-control-agent" / "compose.smoke.yml").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "needle"),
+    [
+        ("{text}\n    privileged: true\n", "privileged"),
+        ("{text}\n    cap_add: [NET_ADMIN]\n", "cap_add"),
+        ("{text}\n    ports: ['127.0.0.1:9999:9999']\n", "publishes a port"),
+        ("{text}\n    volumes: ['/var/run/docker.sock:/var/run/docker.sock']\n", "Docker socket"),
+        ("{text}\n    network_mode: host\n", "network_mode"),
+    ],
+)
+def test_a_violating_overlay_file_fails_the_overlay_rules(tmp_path: Path, mutation: str, needle: str) -> None:
+    # `{text}` ends inside the service block, so each mutation appends one
+    # more key to the service.
+    text = _agent_overlay_text().split("\nnetworks:")[0].rstrip("\n")
+    overlay = tmp_path / "realtime-control-agent" / "compose.smoke.yml"
+    overlay.parent.mkdir()
+    network_block = "\n\nnetworks:" + _agent_overlay_text().split("\nnetworks:")[1]
+    overlay.write_text(mutation.format(text=text) + network_block, encoding="utf-8")
+    with pytest.raises(AssertionError, match=needle):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_overlay_that_drops_its_network_rename_fails_the_overlay_rules(tmp_path: Path) -> None:
+    overlay = tmp_path / "realtime-control-agent" / "compose.smoke.yml"
+    overlay.parent.mkdir()
+    overlay.write_text(_agent_overlay_text().replace("name: derhost-smoke-net\n    ", ""), encoding="utf-8")
+    with pytest.raises(AssertionError, match="renamed"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_overlay_naming_fixtures_fail() -> None:
+    path = DOCKER_DIR / "realtime-control-agent" / "compose.smoke.yml"
+    good = load_compose(path)
+    service = good["services"]["derhost-realtime-control-agent"]
+    renamed_container = {
+        **good,
+        "services": {"derhost-realtime-control-agent": {**service, "container_name": "derhost-realtime-control-agent"}},
+    }
+    with pytest.raises(AssertionError, match="container_name"):
+        check_overlay(path, renamed_container)
+    local_tag = {
+        **good,
+        "services": {"derhost-realtime-control-agent": {**service, "image": "derhost-realtime-control-agent:local"}},
+    }
+    with pytest.raises(AssertionError, match=":smoke"):
+        check_overlay(path, local_tag)
+    with pytest.raises(AssertionError, match="expected name"):
+        check_overlay(path, {**good, "name": "derhost-realtime-control-agent"})
