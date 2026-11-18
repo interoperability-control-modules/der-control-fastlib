@@ -289,3 +289,16 @@ def test_compose_resolves_once_der_agent_src_is_set() -> None:
     result = _run_compose_config("unused")
     assert result.returncode == 0, result.stderr
     assert "agent_src:" in result.stdout
+
+
+def test_build_honors_an_exported_der_agent_src(agent_checkout: Path, tmp_path: Path) -> None:
+    # `stack-up C=all` refuses an exported DER_AGENT_SRC because it would hit
+    # every agent; a single agent's build.sh must keep building from it.
+    (agent_checkout / "rt_control" / "extra.py").write_text("# second commit\n")
+    _git(agent_checkout, "add", "-A")
+    _git(agent_checkout, "commit", "-q", "-m", "second")
+    result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout))
+    assert result.returncode == 0, result.stderr
+    assert (log_dir / "agent_revision.txt").read_text() == _git_head(agent_checkout)
+    assert (log_dir / "agent_py.txt").read_text().strip() == "present"
+    assert (log_dir / "der_agent_src.txt").read_text() != str(agent_checkout)

@@ -34,11 +34,13 @@ Run from the repository root.
   `AGENT_DIRS` (`docker/docker.mk`): interoperability-service and
   realtime-control-agent. Each agent is built by its own `build.sh` (dirty
   checkout refused) and started with `--no-build`; the first failure stops
-  the run. Leave `DER_AGENT_SRC` unset: it would apply to every agent, and
-  each uses its sibling checkout by default.
+  the run. `C=all` refuses to start while `DER_AGENT_SRC` is set, since it
+  would apply to every agent; each uses its sibling checkout by default.
 - `make stack-down` - stop everything under `docker/` (each agent first, then
   the server, since agents join the server's network and it must be free of
-  attached containers before the server's own `down` can remove it).
+  attached containers before the server's own `down` can remove it). A failed
+  agent `down` does not stop the rest; the command exits non-zero at the end
+  naming each agent whose `down` failed.
 - `make stack-status` - `docker compose ps` for each stack.
 - `make stack-check` - `GET /connections` from the host and confirm the
   identities in `EXPECTED` (comma-separated) are connected; `EXPECTED=`

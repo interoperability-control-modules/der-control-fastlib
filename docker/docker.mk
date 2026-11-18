@@ -252,6 +252,10 @@ stack-up: ## Start the stack: C=server or C=all (server first, then any other do
 	if [ "$$c" != "server" ] && [ "$$c" != "all" ]; then \
 		echo "Error: set C=server or C=all (got C=$$c)" >&2; \
 		exit 1; \
+	fi; \
+	if [ "$$c" = "all" ] && [ -n "$${DER_AGENT_SRC:-}" ]; then \
+		echo "Error: DER_AGENT_SRC is set; C=all builds every agent and build.sh resolves each agent's checkout itself, so unset it (build.sh run alone still honors it)" >&2; \
+		exit 1; \
 	fi
 	$(call pass-through,DERHOST_PUBLISH_HOST) $(MAKE) --no-print-directory stack-preflight
 	@$(call pass-through,DERHOST_PUBLISH_HOST) docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) up -d --build
@@ -269,11 +273,19 @@ stack-up: ## Start the stack: C=server or C=all (server first, then any other do
 
 .PHONY: stack-down
 stack-down: ## Stop the stack (any other docker/*/docker-compose.yml, then the server)
-	@for f in $$OTHER_COMPOSE_FILES; do \
+	@failed=""; \
+	for f in $$OTHER_COMPOSE_FILES; do \
 		dir=$$(dirname "$$f"); \
-		DER_AGENT_SRC=unused docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" down || true; \
-	done
-	-docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) down
+		name=$$(basename "$$dir"); \
+		DER_AGENT_SRC=unused docker compose -p "derhost-$$name" -f "$$f" --project-directory "$$dir" down \
+			|| failed="$$failed $$name"; \
+	done; \
+	docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) down \
+		|| echo "Warning: server down failed (ignored)" >&2; \
+	if [ -n "$$failed" ]; then \
+		echo "Error: down failed for:$$failed" >&2; \
+		exit 1; \
+	fi
 
 .PHONY: stack-status
 stack-status: ## Show status of the derhost stack

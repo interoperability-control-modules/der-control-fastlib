@@ -47,6 +47,20 @@ if [ "${1-}" = "compose" ]; then
     case "$sub" in
         config) exec "$STUB_REAL_DOCKER" compose "$@" ;;
         up|down|ps|build)
+            # STUB_FAIL lists "<subcommand>:<project directory name>" pairs
+            # whose call fails, after it is logged, as a daemon error would.
+            where=""
+            for ((i = 0; i < ${#pre[@]}; i++)); do
+                if [ "${pre[$i]}" = "--project-directory" ]; then
+                    where="$(basename "${pre[$((i + 1))]}")"
+                fi
+            done
+            case " ${STUB_FAIL-} " in
+                *" $sub:$where "*)
+                    echo "stub: forced failure of $sub for $where" >&2
+                    exit 1
+                    ;;
+            esac
             # Docker loads the compose file before any of these; a file it
             # cannot load (a required variable unset) fails the call here too.
             rc=0
@@ -89,15 +103,17 @@ def docker_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return log_path
 
 
-def _run_make(*args: str, overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run_make(
+    *args: str, overrides: dict[str, str] | None = None, cwd: Path = REPO_ROOT
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    for key in (*_OVERRIDE_KEYS, *_MAKE_RECURSION_KEYS):
+    for key in (*_OVERRIDE_KEYS, "DER_AGENT_SRC", *_MAKE_RECURSION_KEYS):
         env.pop(key, None)
     if overrides:
         env.update(overrides)
     return subprocess.run(
         ["make", *args],
-        cwd=REPO_ROOT,
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
@@ -160,19 +176,28 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
 
 
-def _agents_checkout(tmp_path: Path, *, with_interoperability: bool = True) -> Path:
-    """A committed throwaway checkout holding both agents' archived paths."""
-    repo = tmp_path / "agents-src"
-    (repo / "rt_control").mkdir(parents=True)
-    (repo / "rt_control" / "agent.py").write_text("# placeholder\n")
-    if with_interoperability:
-        (repo / "src" / "interoperability").mkdir(parents=True)
-        (repo / "src" / "interoperability" / "agent.py").write_text("# placeholder\n")
+def _committed_checkout(repo: Path, archived_path: str) -> None:
+    (repo / archived_path).mkdir(parents=True)
+    (repo / archived_path / "agent.py").write_text("# placeholder\n")
     _git(repo, "init", "-q")
     _git(repo, "config", "user.email", "test@example.invalid")
     _git(repo, "config", "user.name", "test")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "init")
+
+
+def _stack_tree(tmp_path: Path, *, with_interoperability: bool = True) -> Path:
+    """A copy of this repo's Makefile and docker/ beside one committed
+    checkout per agent. build.sh resolves each agent as a sibling of its
+    repository root, so no DER_AGENT_SRC is needed, which `C=all` requires.
+    Returns the copied repository root."""
+    repo = tmp_path / "tree" / "der-control-fastlib"
+    repo.mkdir(parents=True)
+    shutil.copy(REPO_ROOT / "Makefile", repo / "Makefile")
+    shutil.copytree(REPO_ROOT / "docker", repo / "docker")
+    interop_path = "src/interoperability" if with_interoperability else "elsewhere"
+    _committed_checkout(repo.parent / "interoperability-service", interop_path)
+    _committed_checkout(repo.parent / "realtime-control-agent", "rt_control")
     return repo
 
 
@@ -194,9 +219,24 @@ def test_stub_refuses_an_agent_compose_file_it_cannot_load(docker_stub: Path) ->
     env = dict(os.environ)
     env.pop("DER_AGENT_SRC", None)
     result = subprocess.run(
-        ["docker", "compose", "-p", "derhost-x", "-f", "docker/realtime-control-agent/docker-compose.yml",
-         "--project-directory", "docker/realtime-control-agent", "up", "-d", "--no-build"],
-        cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False,
+        [
+            "docker",
+            "compose",
+            "-p",
+            "derhost-x",
+            "-f",
+            "docker/realtime-control-agent/docker-compose.yml",
+            "--project-directory",
+            "docker/realtime-control-agent",
+            "up",
+            "-d",
+            "--no-build",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert result.returncode != 0
     assert _load_results(docker_stub) == ["up rc=1"]
@@ -230,12 +270,10 @@ def test_stack_status_default_covers_the_server_and_both_agents(docker_stub: Pat
     assert _load_results(docker_stub) == ["ps rc=0"] * 3
 
 
-def test_stack_up_all_default_builds_and_starts_the_server_then_both_agents(
-    docker_stub: Path, tmp_path: Path
-) -> None:
+def test_stack_up_all_default_builds_and_starts_the_server_then_both_agents(docker_stub: Path, tmp_path: Path) -> None:
     _require_free_stack_port()
-    checkout = _agents_checkout(tmp_path)
-    result = _run_make("stack-up", overrides={"C": "all", "DER_AGENT_SRC": str(checkout)})
+    tree = _stack_tree(tmp_path)
+    result = _run_make("stack-up", overrides={"C": "all"}, cwd=tree)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = _stub_calls(docker_stub.read_text())
     dirs = _project_dirs(calls, "up")
@@ -254,9 +292,10 @@ def test_stack_up_all_default_builds_and_starts_the_server_then_both_agents(
         ("build", "realtime-control-agent"),
         ("up", "realtime-control-agent"),
     ], events
+    sibling_checkouts = {str(tree.parent / "interoperability-service"), str(tree.parent / "realtime-control-agent")}
     for sub, _, der_agent_src, call in events:
         if sub == "build":
-            assert der_agent_src not in ("unused", str(checkout)), der_agent_src
+            assert der_agent_src != "unused" and der_agent_src not in sibling_checkouts, der_agent_src
         else:
             assert der_agent_src == "unused", der_agent_src
             assert "--no-build" in call and "--build" not in call, call
@@ -265,10 +304,79 @@ def test_stack_up_all_default_builds_and_starts_the_server_then_both_agents(
 
 def test_stack_up_all_stops_at_the_first_failing_agent(docker_stub: Path, tmp_path: Path) -> None:
     _require_free_stack_port()
-    checkout = _agents_checkout(tmp_path, with_interoperability=False)
-    result = _run_make("stack-up", overrides={"C": "all", "DER_AGENT_SRC": str(checkout)})
+    tree = _stack_tree(tmp_path, with_interoperability=False)
+    result = _run_make("stack-up", overrides={"C": "all"}, cwd=tree)
     assert result.returncode != 0, result.stdout + result.stderr
-    assert "interoperability-service" in result.stderr, result.stderr
+    assert "Error: build.sh failed for interoperability-service" in result.stderr, result.stderr
     events = _agent_events(docker_stub.read_text())
     assert [name for _, name, _, _ in events if name == "realtime-control-agent"] == [], events
     assert [sub for sub, name, _, _ in events if name == "interoperability-service"] == [], events
+
+
+def test_stack_up_all_stops_when_the_first_agent_fails_to_start(
+    docker_stub: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_free_stack_port()
+    tree = _stack_tree(tmp_path)
+    monkeypatch.setenv("STUB_FAIL", "up:interoperability-service")
+    result = _run_make("stack-up", overrides={"C": "all"}, cwd=tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Error: starting interoperability-service failed" in result.stderr, result.stderr
+    events = _agent_events(docker_stub.read_text())
+    assert [(sub, name) for sub, name, _, _ in events] == [
+        ("build", "interoperability-service"),
+        ("up", "interoperability-service"),
+    ], events
+
+
+def test_stack_up_all_refuses_an_exported_der_agent_src_before_starting_anything(
+    docker_stub: Path, tmp_path: Path
+) -> None:
+    result = _run_make("stack-up", overrides={"C": "all", "DER_AGENT_SRC": str(tmp_path)})
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "DER_AGENT_SRC is set" in result.stderr, result.stderr
+    assert "build.sh resolves each agent's checkout itself" in result.stderr, result.stderr
+    # Not even the preflight's `compose config` ran.
+    assert docker_stub.read_text() == ""
+
+
+def test_stack_up_server_ignores_an_exported_der_agent_src(docker_stub: Path, tmp_path: Path) -> None:
+    # Control for the refusal above: only C=all refuses, since only C=all
+    # builds agents.
+    _require_free_stack_port()
+    result = _run_make("stack-up", overrides={"C": "server", "DER_AGENT_SRC": str(tmp_path)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "DER_AGENT_SRC is set" not in result.stderr
+    assert _project_dirs(_stub_calls(docker_stub.read_text()), "up") == ["docker/server"]
+
+
+def test_stack_down_carries_on_past_a_failing_agent_then_exits_non_zero(
+    docker_stub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STUB_FAIL", "down:interoperability-service")
+    result = _run_make("stack-down")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Error: down failed for: interoperability-service" in result.stderr, result.stderr
+    assert "realtime-control-agent" not in result.stderr, result.stderr
+    # The failing agent does not stop the other agent or the server.
+    dirs = _project_dirs(_stub_calls(docker_stub.read_text()), "down")
+    assert dirs == [
+        "docker/interoperability-service",
+        "docker/realtime-control-agent",
+        "docker/server",
+    ], dirs
+
+
+def test_stack_down_names_every_agent_whose_down_failed(docker_stub: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STUB_FAIL", "down:interoperability-service down:realtime-control-agent")
+    result = _run_make("stack-down")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Error: down failed for: interoperability-service realtime-control-agent" in result.stderr, result.stderr
+    assert _project_dirs(_stub_calls(docker_stub.read_text()), "down")[-1] == "docker/server"
+
+
+def test_stack_down_still_ignores_a_failing_server_down(docker_stub: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STUB_FAIL", "down:server")
+    result = _run_make("stack-down")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Warning: server down failed (ignored)" in result.stderr, result.stderr
