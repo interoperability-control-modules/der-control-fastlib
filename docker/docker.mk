@@ -61,14 +61,17 @@ pass-through = $(if $(filter-out undefined,$($(1)_ORIGIN)),$(1)=$(call shell-saf
 # Agent directories under docker/, named here rather than discovered by a
 # filesystem glob: a name this list does not carry is invisible to every
 # stack-* target, so filesystem text (a stray directory, a name with a
-# shell metacharacter) never reaches a recipe. Empty at this PR; each later
-# per-agent PR adds its one directory name. A listed directory with no
-# docker-compose.yml fails `stack-up` the same way a typo would. Each
+# shell metacharacter) never reaches a recipe. Each later per-agent PR adds
+# its one directory name. A listed directory with no docker-compose.yml
+# fails `stack-up` the same way a typo would. Each
 # agent's own compose calls below pass -p derhost-<dir>, the same pinning
 # the server project already has, so an exported COMPOSE_PROJECT_NAME
 # cannot retarget an agent's stack-up/down/status the way it could the
-# server's before that fix.
-AGENT_DIRS :=
+# server's before that fix. Every agent compose call sets
+# DER_AGENT_SRC=unused, because a compose file needs it to load at all;
+# stack-up builds through each agent's own build.sh (check-clean and git
+# archive included) first, then starts it with --no-build.
+AGENT_DIRS := interoperability-service realtime-control-agent
 
 override OTHER_COMPOSE_FILES := $(foreach d,$(AGENT_DIRS),$(DOCKER_DIR)/$(d)/docker-compose.yml)
 export OTHER_COMPOSE_FILES
@@ -249,6 +252,10 @@ stack-up: ## Start the stack: C=server or C=all (server first, then any other do
 	if [ "$$c" != "server" ] && [ "$$c" != "all" ]; then \
 		echo "Error: set C=server or C=all (got C=$$c)" >&2; \
 		exit 1; \
+	fi; \
+	if [ "$$c" = "all" ] && [ -n "$${DER_AGENT_SRC:-}" ]; then \
+		echo "Error: DER_AGENT_SRC is set; C=all builds every agent and build.sh resolves each agent's checkout itself, so unset it (build.sh run alone still honors it)" >&2; \
+		exit 1; \
 	fi
 	$(call pass-through,DERHOST_PUBLISH_HOST) $(MAKE) --no-print-directory stack-preflight
 	@$(call pass-through,DERHOST_PUBLISH_HOST) docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) up -d --build
@@ -257,24 +264,35 @@ stack-up: ## Start the stack: C=server or C=all (server first, then any other do
 	if [ "$$c" = "all" ]; then \
 		for f in $$OTHER_COMPOSE_FILES; do \
 			dir=$$(dirname "$$f"); \
-			docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" up -d --build; \
+			name=$$(basename "$$dir"); \
+			bash "$$dir/build.sh" || { echo "Error: build.sh failed for $$name" >&2; exit 1; }; \
+			DER_AGENT_SRC=unused docker compose -p "derhost-$$name" -f "$$f" --project-directory "$$dir" up -d --no-build \
+				|| { echo "Error: starting $$name failed" >&2; exit 1; }; \
 		done; \
 	fi
 
 .PHONY: stack-down
 stack-down: ## Stop the stack (any other docker/*/docker-compose.yml, then the server)
-	@for f in $$OTHER_COMPOSE_FILES; do \
+	@failed=""; \
+	for f in $$OTHER_COMPOSE_FILES; do \
 		dir=$$(dirname "$$f"); \
-		docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" down || true; \
-	done
-	-docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) down
+		name=$$(basename "$$dir"); \
+		DER_AGENT_SRC=unused docker compose -p "derhost-$$name" -f "$$f" --project-directory "$$dir" down \
+			|| failed="$$failed $$name"; \
+	done; \
+	docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) down \
+		|| echo "Warning: server down failed (ignored)" >&2; \
+	if [ -n "$$failed" ]; then \
+		echo "Error: down failed for:$$failed" >&2; \
+		exit 1; \
+	fi
 
 .PHONY: stack-status
 stack-status: ## Show status of the derhost stack
 	-docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) ps
 	@for f in $$OTHER_COMPOSE_FILES; do \
 		dir=$$(dirname "$$f"); \
-		docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" ps || true; \
+		DER_AGENT_SRC=unused docker compose -p "derhost-$$(basename "$$dir")" -f "$$f" --project-directory "$$dir" ps || true; \
 	done
 
 .PHONY: stack-check
