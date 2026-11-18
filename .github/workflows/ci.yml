@@ -79,7 +79,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.10'
+          # Fixed filelock releases require Python 3.11 or later.
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
