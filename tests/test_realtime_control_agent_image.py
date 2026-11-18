@@ -134,17 +134,8 @@ def test_config_example_use_cases_is_empty() -> None:
 
 
 def test_config_example_modes_is_empty() -> None:
-    # Every mode class in rt_control.modes.active/reactive/emergency calls
-    # importlib.metadata.version('volttron') at module import time with no
-    # PackageNotFoundError guard (e.g. active_power_response.py imports
-    # active/__init__.py, which imports active_power_limit.py:4 at 16804d8),
-    # so the whole subpackage fails to import wherever volttron itself is
-    # not pip-installed, which this image deliberately never does. Every
-    # class in rt_control.modes.novel imports the julia package
-    # unconditionally at module scope (es_control_mode.py:2 at 16804d8), so
-    # that subpackage fails to import in this image too, by the operator's
-    # own no-Julia decision. No configured mode is currently reachable in
-    # this container; left empty rather than reproducing either defect.
+    # No mode is configured: rt_control.modes.novel imports julia at module
+    # scope (es_control_mode.py:2 at 6ea0e71), and this image installs no Julia.
     config = json.loads((AGENT_DIR / "config.example.json").read_text(encoding="utf-8"))
     assert config["modes"] == []
 

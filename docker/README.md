@@ -14,6 +14,9 @@ land in earlier PRs; `docker/realtime-control-agent/` runs native control
 modes only, with no Julia in the image (operator decision, #68): its baked-in
 `config.example.json` sets no mode's `use_julia` to true.
 
+With that config the image runs no control mode: `modes` and `use_cases` are
+both empty.
+
 If a configured mode ever sets `use_julia: true` with no `julia` package
 installed, the agent does not crash or refuse to start: the import happens
 lazily, on the first control tick that mode runs. `derhost`'s scheduler runs
