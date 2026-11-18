@@ -493,6 +493,21 @@ _FORBIDDING_RULES = (
 )
 
 
+# An overlay may not set, or `!reset`, any key a base file hardens with. The
+# alternative, running every rule over the merged base plus overlay, needs
+# `docker compose config` per file; refusing the keys outright keeps this a
+# static read, and an overlay has no reason to touch them: it only renames
+# objects. A `!reset []` loads as its plain value, so key presence is what is
+# checked, and `cap_drop: !reset []` is as visible as `user: "0"`.
+_OVERLAY_FORBIDDEN_KEYS = ("user", "cap_drop", "security_opt", "read_only", "privileged", "network_mode", "devices")
+
+
+def check_overlay_sets_no_hardening_key(name: str, service: dict[str, Any]) -> None:
+    for key in _OVERLAY_FORBIDDEN_KEYS:
+        if key in service:
+            raise AssertionError(f"{name}: an overlay may not set or reset {key}, got {service[key]!r}")
+
+
 def discover_overlay_files() -> list[Path]:
     """Every docker/<name>/compose.smoke.yml under the repo root."""
     return sorted(DOCKER_DIR.glob("*/compose.smoke.yml"))
@@ -504,6 +519,7 @@ def check_overlay(path: Path, compose: dict[str, Any]) -> None:
     for name, service in compose.get("services", {}).items():
         for rule in _FORBIDDING_RULES:
             rule(name, service)
+        check_overlay_sets_no_hardening_key(name, service)
         expected_container = "derhost-smoke-server" if is_server else f"derhost-smoke-{directory}"
         if service.get("container_name") != expected_container:
             raise AssertionError(
@@ -556,6 +572,11 @@ def _agent_overlay_text() -> str:
         ("{text}\n    ports: ['127.0.0.1:9999:9999']\n", "publishes a port"),
         ("{text}\n    volumes: ['/var/run/docker.sock:/var/run/docker.sock']\n", "Docker socket"),
         ("{text}\n    network_mode: host\n", "network_mode"),
+        ("{text}\n    user: '0'\n", "user"),
+        ("{text}\n    cap_drop: !reset []\n", "cap_drop"),
+        ("{text}\n    security_opt: !reset []\n", "security_opt"),
+        ("{text}\n    read_only: false\n", "read_only"),
+        ("{text}\n    devices: ['/dev/mem:/dev/mem']\n", "devices"),
     ],
 )
 def test_a_violating_overlay_file_fails_the_overlay_rules(tmp_path: Path, mutation: str, needle: str) -> None:
@@ -567,6 +588,21 @@ def test_a_violating_overlay_file_fails_the_overlay_rules(tmp_path: Path, mutati
     network_block = "\n\nnetworks:" + _agent_overlay_text().split("\nnetworks:")[1]
     overlay.write_text(mutation.format(text=text) + network_block, encoding="utf-8")
     with pytest.raises(AssertionError, match=needle):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_the_overlay_that_weakens_user_cap_drop_and_security_opt_together_fails(tmp_path: Path) -> None:
+    # The overlay that merged to user 0 with no capability drop and no
+    # no-new-privileges, which every per-key rule above let through.
+    text = _agent_overlay_text().split("\nnetworks:")[0].rstrip("\n")
+    network_block = "\n\nnetworks:" + _agent_overlay_text().split("\nnetworks:")[1]
+    overlay = tmp_path / "realtime-control-agent" / "compose.smoke.yml"
+    overlay.parent.mkdir()
+    weakening = '\n    user: "0"\n    cap_drop: !reset []\n    security_opt: !reset []\n'
+    overlay.write_text(text + weakening + network_block, encoding="utf-8")
+    loaded = load_compose(overlay)["services"]["derhost-realtime-control-agent"]
+    assert (loaded["user"], loaded["cap_drop"], loaded["security_opt"]) == ("0", [], [])
+    with pytest.raises(AssertionError, match="may not set or reset user"):
         check_overlay(overlay, load_compose(overlay))
 
 
