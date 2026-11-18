@@ -7,6 +7,7 @@ rt_control package layout (no src/ prefix, unlike interoperability-service).
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -72,11 +73,11 @@ def test_allow_dirty_bypasses_the_refusal(scratch_checkout: Path) -> None:
 
 def test_wrapper_forwards_the_shared_script_message() -> None:
     # The wrapper execs docker/lib/check-clean.sh rather than reimplementing
-    # it; a message unique to that shared script proves the exec happened.
-    not_a_repo_message = "check-clean: is not a git checkout"
-    result = _run_check_clean(REPO_ROOT / "docker" / "realtime-control-agent" / "config.example.json")
+    # it; the shared script's own full message proves the exec happened.
+    target = REPO_ROOT / "docker" / "realtime-control-agent" / "config.example.json"
+    result = _run_check_clean(target)
     assert result.returncode == 1
-    assert not_a_repo_message.split(":")[0] in result.stderr
+    assert f"check-clean: {target} is not a git checkout" in result.stderr
 
 
 # --- build.sh: archive isolation, committed-content-only, rt_control layout -
@@ -136,6 +137,7 @@ def _run_build_sh(
     cwd: Path,
     der_agent_src: str,
     allow_dirty: str | None = None,
+    docker_on_path: bool = True,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     log_dir = tmp_path / "stub-log"
@@ -144,14 +146,23 @@ def _run_build_sh(
     _stub_docker_bin(bin_dir, log_dir)
 
     env = dict(os.environ)
-    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    if docker_on_path:
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    else:
+        # A PATH holding only the tools build.sh needs before its docker
+        # check, so no docker binary can be found.
+        bare_bin = tmp_path / "bare-bin"
+        bare_bin.mkdir()
+        for tool in ("dirname", "git", "tar", "mktemp", "rm"):
+            (bare_bin / tool).symlink_to(shutil.which(tool) or tool)
+        env["PATH"] = str(bare_bin)
     env["DER_AGENT_SRC"] = der_agent_src
     env.pop("ALLOW_DIRTY", None)
     if allow_dirty is not None:
         env["ALLOW_DIRTY"] = allow_dirty
 
     result = subprocess.run(
-        ["bash", str(BUILD_SH)],
+        [shutil.which("bash") or "bash", str(BUILD_SH)],
         capture_output=True,
         text=True,
         env=env,
@@ -208,6 +219,44 @@ def test_build_label_never_claims_dirty_content_it_does_not_ship(agent_checkout:
     assert dirty_result.returncode == 0, dirty_result.stderr
     dirty_revision = (dirty_log / "agent_revision.txt").read_text()
     assert dirty_revision == clean_revision, dirty_revision
+
+
+def _git_head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_build_stamps_the_agent_checkout_head_as_the_revision(agent_checkout: Path, tmp_path: Path) -> None:
+    result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout))
+    assert result.returncode == 0, result.stderr
+    revision = (log_dir / "agent_revision.txt").read_text()
+    assert len(revision) == 40, revision
+    assert revision == _git_head(agent_checkout)
+
+
+def test_build_refuses_a_dirty_checkout_before_any_compose_call(agent_checkout: Path, tmp_path: Path) -> None:
+    (agent_checkout / "rt_control" / "agent.py").write_text("# changed\n")
+    result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout))
+    assert result.returncode == 1, result.stderr
+    assert "uncommitted changes" in result.stderr
+    assert " M rt_control/agent.py" in result.stderr
+    assert not (log_dir / "der_agent_src.txt").exists()
+
+
+def test_build_refuses_an_untracked_file_before_any_compose_call(agent_checkout: Path, tmp_path: Path) -> None:
+    (agent_checkout / "rt_control" / "leaked-secret.txt").write_text("JWT_SECRET_KEY=MARKER\n")
+    result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout))
+    assert result.returncode == 1, result.stderr
+    assert "?? rt_control/leaked-secret.txt" in result.stderr
+    assert not (log_dir / "der_agent_src.txt").exists()
+
+
+def test_build_refuses_when_docker_is_not_on_path(agent_checkout: Path, tmp_path: Path) -> None:
+    result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout), docker_on_path=False)
+    assert result.returncode == 1, result.stderr
+    assert "build: docker is required and not on PATH" in result.stderr
+    assert not (log_dir / "der_agent_src.txt").exists()
 
 
 # --- docker-compose.yml: DER_AGENT_SRC has no default (#68) -----------------
