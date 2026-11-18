@@ -493,19 +493,22 @@ _FORBIDDING_RULES = (
 )
 
 
-# An overlay may not set, or `!reset`, any key a base file hardens with. The
-# alternative, running every rule over the merged base plus overlay, needs
-# `docker compose config` per file; refusing the keys outright keeps this a
-# static read, and an overlay has no reason to touch them: it only renames
-# objects. A `!reset []` loads as its plain value, so key presence is what is
-# checked, and `cap_drop: !reset []` is as visible as `user: "0"`.
-_OVERLAY_FORBIDDEN_KEYS = ("user", "cap_drop", "security_opt", "read_only", "privileged", "network_mode", "devices")
+# An overlay may set only the keys it needs to rename the project: `image`
+# and `container_name`, and `ports` on the server. Any other service key, set
+# or `!reset`, is refused. Listing the keys to forbid cannot keep up with what
+# a base file hardens with (limits, tmpfs, healthcheck, build contexts), and an
+# overlay has no reason to touch any of them. A `!reset []` loads as its plain
+# value, so key presence is what is checked.
+_OVERLAY_ALLOWED_KEYS = ("image", "container_name")
+_SERVER_OVERLAY_ALLOWED_KEYS = (*_OVERLAY_ALLOWED_KEYS, "ports")
 
 
-def check_overlay_sets_no_hardening_key(name: str, service: dict[str, Any]) -> None:
-    for key in _OVERLAY_FORBIDDEN_KEYS:
-        if key in service:
-            raise AssertionError(f"{name}: an overlay may not set or reset {key}, got {service[key]!r}")
+def check_overlay_sets_only_allowed_keys(name: str, service: dict[str, Any], allowed: tuple[str, ...]) -> None:
+    for key in service:
+        if key not in allowed:
+            raise AssertionError(
+                f"{name}: an overlay may not set or reset {key}, got {service[key]!r}; allowed keys: {', '.join(allowed)}"
+            )
 
 
 def discover_overlay_files() -> list[Path]:
@@ -519,7 +522,6 @@ def check_overlay(path: Path, compose: dict[str, Any]) -> None:
     for name, service in compose.get("services", {}).items():
         for rule in _FORBIDDING_RULES:
             rule(name, service)
-        check_overlay_sets_no_hardening_key(name, service)
         expected_container = "derhost-smoke-server" if is_server else f"derhost-smoke-{directory}"
         if service.get("container_name") != expected_container:
             raise AssertionError(
@@ -534,6 +536,8 @@ def check_overlay(path: Path, compose: dict[str, Any]) -> None:
                 )
         elif "ports" in service:
             raise AssertionError(f"{name}: publishes a port; only {SERVER_SERVICE} may")
+        allowed = _SERVER_OVERLAY_ALLOWED_KEYS if is_server else _OVERLAY_ALLOWED_KEYS
+        check_overlay_sets_only_allowed_keys(name, service, allowed)
     if not is_server and compose.get("name") != f"derhost-smoke-{directory}":
         raise AssertionError(f"{path}: expected name: derhost-smoke-{directory}, got {compose.get('name')!r}")
     network = (compose.get("networks") or {}).get("derhost-net") or {}
@@ -577,6 +581,12 @@ def _agent_overlay_text() -> str:
         ("{text}\n    security_opt: !reset []\n", "security_opt"),
         ("{text}\n    read_only: false\n", "read_only"),
         ("{text}\n    devices: ['/dev/mem:/dev/mem']\n", "devices"),
+        ("{text}\n    pids_limit: -1\n", "pids_limit"),
+        ("{text}\n    mem_limit: !reset null\n", "mem_limit"),
+        ("{text}\n    tmpfs: !reset []\n", "tmpfs"),
+        ("{text}\n    restart: always\n", "restart"),
+        ("{text}\n    healthcheck: {{disable: true}}\n", "healthcheck"),
+        ("{text}\n    build: {{additional_contexts: {{agent_src: /srv/live}}}}\n", "build"),
     ],
 )
 def test_a_violating_overlay_file_fails_the_overlay_rules(tmp_path: Path, mutation: str, needle: str) -> None:
@@ -603,6 +613,34 @@ def test_the_overlay_that_weakens_user_cap_drop_and_security_opt_together_fails(
     loaded = load_compose(overlay)["services"]["derhost-realtime-control-agent"]
     assert (loaded["user"], loaded["cap_drop"], loaded["security_opt"]) == ("0", [], [])
     with pytest.raises(AssertionError, match="may not set or reset user"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_the_overlay_that_weakens_pids_limit_mem_limit_and_tmpfs_together_fails(tmp_path: Path) -> None:
+    # The overlay that merged to pids_limit -1, no memory limit and no tmpfs,
+    # none of which the per-key hardening list named.
+    text = _agent_overlay_text().split("\nnetworks:")[0].rstrip("\n")
+    network_block = "\n\nnetworks:" + _agent_overlay_text().split("\nnetworks:")[1]
+    overlay = tmp_path / "realtime-control-agent" / "compose.smoke.yml"
+    overlay.parent.mkdir()
+    weakening = "\n    pids_limit: -1\n    mem_limit: !reset null\n    tmpfs: !reset []\n"
+    overlay.write_text(text + weakening + network_block, encoding="utf-8")
+    with pytest.raises(AssertionError, match="may not set or reset pids_limit"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_the_server_overlay_may_set_ports_and_no_other_hardening_key(tmp_path: Path) -> None:
+    # `ports` is the one key the server overlay adds to the two naming keys;
+    # the same file with a limit reset on top of it is refused by that key.
+    server_text = (DOCKER_DIR / "server" / "compose.smoke.yml").read_text(encoding="utf-8")
+    overlay = tmp_path / "server" / "compose.smoke.yml"
+    overlay.parent.mkdir()
+    overlay.write_text(server_text, encoding="utf-8")
+    check_overlay(overlay, load_compose(overlay))
+    marker = "    container_name: derhost-smoke-server\n"
+    assert marker in server_text
+    overlay.write_text(server_text.replace(marker, marker + "    mem_limit: !reset null\n"), encoding="utf-8")
+    with pytest.raises(AssertionError, match="may not set or reset mem_limit"):
         check_overlay(overlay, load_compose(overlay))
 
 
