@@ -20,6 +20,18 @@ build_agent_image() {
     exit 1
   }
 
+  # An overlay (docker/smoke.sh passes its compose.smoke.yml) renames the
+  # service's image, so the build tags that image directly and never writes
+  # the developer's :local tag.
+  local -a compose_files=(-f "${SCRIPT_DIR}/docker-compose.yml")
+  if [ -n "${DERHOST_BUILD_OVERLAY:-}" ]; then
+    if [ ! -f "${DERHOST_BUILD_OVERLAY}" ]; then
+      echo "build: DERHOST_BUILD_OVERLAY ${DERHOST_BUILD_OVERLAY} is not a file" >&2
+      exit 1
+    fi
+    compose_files+=(-f "${DERHOST_BUILD_OVERLAY}")
+  fi
+
   # check-clean.sh validates agent_src itself, not-a-checkout included;
   # compose never sees agent_src directly, only the absolute archive_dir
   # exported below, so this path does not need canonicalizing (#68).
@@ -46,5 +58,5 @@ build_agent_image() {
     docker build --target base -t derhost-base:local -f "${REPO_ROOT}/docker/server/Dockerfile" "${REPO_ROOT}"
   fi
 
-  docker compose -f "${SCRIPT_DIR}/docker-compose.yml" build
+  docker compose "${compose_files[@]}" build
 }
