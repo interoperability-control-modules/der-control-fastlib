@@ -10,12 +10,15 @@ here is not a check that could never fail.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_DIR = REPO_ROOT / "docker" / "realtime-control-agent"
+REVISION_AGENTS = ("interoperability-service", "realtime-control-agent")
 
 
 def _uncommented_lines(text: str) -> str:
@@ -166,3 +169,59 @@ def test_dockerfile_cmd_enables_debug_logging() -> None:
     # no tick ever appears in the container's log (#68).
     dockerfile = (AGENT_DIR / "Dockerfile").read_text(encoding="utf-8")
     assert '"--debug"' in dockerfile, dockerfile
+
+
+# --- the revision stamp: compose build arg -> Dockerfile ARG -> LABEL ------
+
+
+def _build_args(agent: str, revision: str | None) -> dict[str, str]:
+    env = dict(os.environ, DER_AGENT_SRC="unused")
+    env.pop("AGENT_REVISION", None)
+    if revision is not None:
+        env["AGENT_REVISION"] = revision
+    compose_file = REPO_ROOT / "docker" / agent / "docker-compose.yml"
+    result = subprocess.run(
+        ["docker", "compose", "-f", str(compose_file), "config", "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    return json.loads(result.stdout)["services"][f"derhost-{agent}"]["build"]["args"]
+
+
+@pytest.mark.parametrize("agent", REVISION_AGENTS)
+def test_compose_passes_the_exported_revision_through_as_a_build_arg(agent: str) -> None:
+    assert _build_args(agent, "abc123") == {"AGENT_REVISION": "abc123"}
+
+
+@pytest.mark.parametrize("agent", REVISION_AGENTS)
+def test_compose_revision_build_arg_falls_back_to_unknown_when_unset(agent: str) -> None:
+    # Control: a fixed value in the compose file would pass the test above
+    # only by luck; the fallback shows the arg is read from the environment.
+    assert _build_args(agent, None) == {"AGENT_REVISION": "unknown"}
+
+
+def check_dockerfile_stamps_the_revision(text: str) -> None:
+    lines = [line.strip() for line in text.splitlines()]
+    label = "LABEL org.opencontainers.image.revision=${AGENT_REVISION}"
+    if label not in lines:
+        raise AssertionError(f"no {label!r} line")
+    if "ARG AGENT_REVISION=unknown" not in lines[: lines.index(label)]:
+        raise AssertionError("AGENT_REVISION is not declared by an ARG before the LABEL that uses it")
+
+
+@pytest.mark.parametrize("agent", REVISION_AGENTS)
+def test_dockerfile_labels_the_image_with_the_revision_arg(agent: str) -> None:
+    check_dockerfile_stamps_the_revision((REPO_ROOT / "docker" / agent / "Dockerfile").read_text(encoding="utf-8"))
+
+
+def test_check_dockerfile_stamps_the_revision_fixture_fails_without_the_label() -> None:
+    with pytest.raises(AssertionError, match="no 'LABEL"):
+        check_dockerfile_stamps_the_revision("ARG AGENT_REVISION=unknown\n")
+
+
+def test_check_dockerfile_stamps_the_revision_fixture_fails_without_the_arg() -> None:
+    # Control: a LABEL whose ARG is undeclared expands to an empty string.
+    with pytest.raises(AssertionError, match="not declared by an ARG"):
+        check_dockerfile_stamps_the_revision("LABEL org.opencontainers.image.revision=${AGENT_REVISION}\n")

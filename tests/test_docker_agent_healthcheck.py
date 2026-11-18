@@ -76,3 +76,25 @@ def test_healthcheck_reads_pid_1_for_the_agent_script(agent: str, source: str, t
     assert _run(_with_cmdline_file(code, cmdline)) == 0
     cmdline.write_bytes(b"sleep\x00100\x00")
     assert _run(_with_cmdline_file(code, cmdline)) == 1
+
+
+@pytest.mark.parametrize("agent", AGENTS)
+@pytest.mark.parametrize("source", ["Dockerfile", "compose"])
+def test_healthcheck_is_unhealthy_when_pid_1_is_another_python_script(agent: str, source: str, tmp_path: Path) -> None:
+    # Matching on the interpreter alone would pass any python3 PID 1.
+    code = _dockerfile_code(agent) if source == "Dockerfile" else _compose_code(agent)
+    cmdline = tmp_path / "cmdline"
+    cmdline.write_bytes(b"python3\x00/app/other.py\x00")
+    assert _run(_with_cmdline_file(code, cmdline)) == 1
+
+
+@pytest.mark.parametrize("agent", AGENTS)
+def test_agent_is_pid_1_so_the_check_can_read_it(agent: str) -> None:
+    # An init wrapper or ENTRYPOINT shell would become PID 1 and carry the
+    # script name in its own command line, making the check pass with the
+    # agent dead.
+    compose = yaml.safe_load((DOCKER_DIR / agent / "docker-compose.yml").read_text(encoding="utf-8"))
+    assert "init" not in compose["services"][f"derhost-{agent}"]
+    dockerfile = (DOCKER_DIR / agent / "Dockerfile").read_text(encoding="utf-8")
+    entrypoints = [line for line in dockerfile.splitlines() if line.strip().upper().startswith("ENTRYPOINT")]
+    assert entrypoints == []
