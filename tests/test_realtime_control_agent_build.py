@@ -346,5 +346,38 @@ def test_build_refuses_an_overlay_that_is_not_a_file_before_any_compose_call(
     missing = tmp_path / "no-such-overlay.yml"
     result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout), overlay=str(missing))
     assert result.returncode == 1, result.stderr
-    assert f"DERHOST_BUILD_OVERLAY {missing} is not a file" in result.stderr
+    assert f"DERHOST_BUILD_OVERLAY {missing} is not this agent's compose.smoke.yml" in result.stderr
+    assert not (log_dir / "compose_args.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        REPO_ROOT / "docker" / "interoperability-service" / "compose.smoke.yml",
+        REPO_ROOT / "docker" / "server" / "compose.smoke.yml",
+        REPO_ROOT / "docker" / "realtime-control-agent" / "docker-compose.yml",
+    ],
+)
+def test_build_refuses_an_existing_file_that_is_not_its_own_overlay(
+    agent_checkout: Path, tmp_path: Path, other: Path
+) -> None:
+    # A file that exists is not enough: another agent's overlay, the server's,
+    # or the base file itself would rename or replace what this build tags.
+    assert other.is_file(), other
+    result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout), overlay=str(other))
+    assert result.returncode == 1, result.stderr
+    assert f"DERHOST_BUILD_OVERLAY {other} is not this agent's compose.smoke.yml" in result.stderr
+    assert str(SMOKE_OVERLAY) in result.stderr
+    assert not (log_dir / "compose_args.txt").exists()
+
+
+def test_build_refuses_an_overlay_outside_the_docker_tree_even_when_it_has_the_right_name(
+    agent_checkout: Path, tmp_path: Path
+) -> None:
+    lookalike = tmp_path / "elsewhere" / "compose.smoke.yml"
+    lookalike.parent.mkdir()
+    lookalike.write_text(SMOKE_OVERLAY.read_text(encoding="utf-8"), encoding="utf-8")
+    result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout), overlay=str(lookalike))
+    assert result.returncode == 1, result.stderr
+    assert "is not this agent's compose.smoke.yml" in result.stderr
     assert not (log_dir / "compose_args.txt").exists()

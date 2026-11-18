@@ -35,7 +35,9 @@ Run from the repository root.
   realtime-control-agent. Each agent is built by its own `build.sh` (dirty
   checkout refused) and started with `--no-build`; the first failure stops
   the run. `C=all` refuses to start while `DER_AGENT_SRC` is set, since it
-  would apply to every agent; each uses its sibling checkout by default.
+  would apply to every agent; each uses its sibling checkout by default. It
+  also refuses while `DERHOST_BUILD_OVERLAY` is set: only `stack-smoke` sets
+  it, and a `build.sh` accepts no file but its own `compose.smoke.yml`.
 - `make stack-down` - stop everything under `docker/` (each agent first, then
   the server, since agents join the server's network and it must be free of
   attached containers before the server's own `down` can remove it). A failed

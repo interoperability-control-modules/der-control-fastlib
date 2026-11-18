@@ -260,6 +260,10 @@ stack-up: ## Start the stack: C=server or C=all (server first, then any other do
 	if [ "$$c" = "all" ] && [ -n "$${DER_AGENT_SRC:-}" ]; then \
 		echo "Error: DER_AGENT_SRC is set; C=all builds every agent and build.sh resolves each agent's checkout itself, so unset it (build.sh run alone still honors it)" >&2; \
 		exit 1; \
+	fi; \
+	if [ "$$c" = "all" ] && [ -n "$${DERHOST_BUILD_OVERLAY:-}" ]; then \
+		echo "Error: DERHOST_BUILD_OVERLAY is set; build.sh would tag the :smoke images while C=all starts the :local ones, so unset it (make stack-smoke sets it for its own builds)" >&2; \
+		exit 1; \
 	fi
 	$(call pass-through,DERHOST_PUBLISH_HOST) $(MAKE) --no-print-directory stack-preflight
 	@$(call pass-through,DERHOST_PUBLISH_HOST) docker compose -p $(SERVER_PROJECT_NAME) -f $(SERVER_COMPOSE) --project-directory $(SERVER_PROJECT_DIR) up -d --build

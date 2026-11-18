@@ -340,6 +340,28 @@ def test_stack_up_all_refuses_an_exported_der_agent_src_before_starting_anything
     assert docker_stub.read_text() == ""
 
 
+def test_stack_up_all_refuses_an_exported_build_overlay_before_starting_anything(
+    docker_stub: Path, tmp_path: Path
+) -> None:
+    # build.sh would tag :smoke while stack-up starts the base file's :local.
+    overlay = REPO_ROOT / "docker" / "realtime-control-agent" / "compose.smoke.yml"
+    result = _run_make("stack-up", overrides={"C": "all", "DERHOST_BUILD_OVERLAY": str(overlay)})
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "DERHOST_BUILD_OVERLAY is set" in result.stderr, result.stderr
+    assert "make stack-smoke sets it for its own builds" in result.stderr, result.stderr
+    assert docker_stub.read_text() == ""
+
+
+def test_stack_up_server_ignores_an_exported_build_overlay(docker_stub: Path, tmp_path: Path) -> None:
+    # Control for the refusal above: only C=all builds agents, so only C=all refuses.
+    _require_free_stack_port()
+    overlay = REPO_ROOT / "docker" / "realtime-control-agent" / "compose.smoke.yml"
+    result = _run_make("stack-up", overrides={"C": "server", "DERHOST_BUILD_OVERLAY": str(overlay)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "DERHOST_BUILD_OVERLAY is set" not in result.stderr, result.stderr
+    assert _project_dirs(_stub_calls(docker_stub.read_text()), "up") == ["docker/server"]
+
+
 def test_stack_up_server_ignores_an_exported_der_agent_src(docker_stub: Path, tmp_path: Path) -> None:
     # Control for the refusal above: only C=all refuses, since only C=all
     # builds agents.
