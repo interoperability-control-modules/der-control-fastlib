@@ -21,7 +21,10 @@ WAIT_TIMEOUT="${DERHOST_SMOKE_WAIT_TIMEOUT:-60}"
 POLL_SECS="${DERHOST_SMOKE_POLL_SECS:-1}"
 RESTART_WINDOW="${DERHOST_SMOKE_RESTART_WINDOW:-10}"
 RESTART_DIR="realtime-control-agent"
+# Seconds `timeout` waits after a forwarded signal before it kills the step.
+KILL_GRACE=10
 CLEANED_UP=0
+CHILD_PID=""
 TEARDOWN_FAILED=()
 BASE_URL=""
 AGENTS=()
@@ -45,15 +48,54 @@ die() {
 # `stack-up` project (docker/server/compose.smoke.yml).
 COMPOSE_ARGS=(docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" -f "$SMOKE_OVERLAY" --project-directory "$PROJECT_DIR")
 
-# Runs docker compose for one agent in its own smoke project. DER_AGENT_SRC
-# only has to be set for the compose file to load: every call here is
-# `--no-build` or a teardown, and the image comes from build.sh.
-agent_compose() {
+# Runs a command as a child and waits for it with `wait`, which returns as
+# soon as a trapped signal arrives. A foreground command would hold the trap
+# until it ended, up to a whole build timeout. Teardown steps stay in the
+# foreground on purpose: they must finish, and an early return from `wait`
+# would start the next step while this one still ran.
+run() {
+    local rc=0
+    "$@" &
+    CHILD_PID=$!
+    wait "$CHILD_PID" || rc=$?
+    CHILD_PID=""
+    return "$rc"
+}
+
+# Ends the step `run` is waiting on. `timeout` forwards the TERM and, with
+# -k, kills the step after KILL_GRACE seconds if it ignores it.
+stop_child() {
+    [ -n "$CHILD_PID" ] || return 0
+    # The step may have exited between the signal and here, and a killed step
+    # reports a non-zero status; neither changes what happens next.
+    kill "$CHILD_PID" 2>/dev/null || true
+    wait "$CHILD_PID" 2>/dev/null || true
+    CHILD_PID=""
+}
+
+# Fills AGENT_CMD with docker compose for one agent in its own smoke project,
+# under `timeout`. DER_AGENT_SRC only has to be set for the compose file to
+# load: every call here is `--no-build` or a teardown, and the image comes
+# from build.sh.
+AGENT_CMD=()
+agent_compose_cmd() {
     local dir="$1" timeout_secs="$2"
     shift 2
-    timeout "$timeout_secs" env DER_AGENT_SRC=unused docker compose -p "derhost-smoke-$dir" \
-        -f "$SCRIPT_DIR/$dir/docker-compose.yml" -f "$SCRIPT_DIR/$dir/compose.smoke.yml" \
-        --project-directory "$SCRIPT_DIR/$dir" "$@"
+    AGENT_CMD=(timeout -k "$KILL_GRACE" "$timeout_secs" env DER_AGENT_SRC=unused docker compose -p "derhost-smoke-$dir"
+        -f "$SCRIPT_DIR/$dir/docker-compose.yml" -f "$SCRIPT_DIR/$dir/compose.smoke.yml"
+        --project-directory "$SCRIPT_DIR/$dir" "$@")
+}
+
+# In the foreground: for teardown and quick steps.
+agent_compose() {
+    agent_compose_cmd "$@"
+    "${AGENT_CMD[@]}"
+}
+
+# As a child `run` waits on: for steps a signal must not wait behind.
+agent_compose_run() {
+    agent_compose_cmd "$@"
+    run "${AGENT_CMD[@]}"
 }
 
 validate_agent_dirs() {
@@ -184,7 +226,7 @@ step_down() {
         # is unique to it, so there is nothing of a developer's stack to reach.
         run_teardown_step "down $dir" agent_compose "$dir" "$STEP_TIMEOUT" down -v --rmi local
     done
-    run_teardown_step "down server" timeout "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" down -v --rmi local
+    run_teardown_step "down server" timeout -k "$KILL_GRACE" "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" down -v --rmi local
     # `down --rmi local` removed the server's :smoke image in a live run but
     # is not relied on for any :smoke tag, so each is removed by name. Only
     # :smoke tags: a developer's :local images are never smoke objects.
@@ -224,9 +266,12 @@ teardown() {
 # original exit status; a teardown failure only turns a would-be 0 into 1.
 cleanup() {
     local status=$?
-    # A second signal during teardown ends the script by default action; the
-    # next run's leftover check then refuses rather than adopting the objects.
-    trap - INT TERM
+    # A signal during teardown is noted and the step in flight finishes: ending
+    # here would leave objects behind for the next run to refuse. The steps are
+    # foreground commands, so the note is printed once the current one ends,
+    # and each step is bounded by its own timeout.
+    trap 'on_teardown_signal INT' INT
+    trap 'on_teardown_signal TERM' TERM
     if [ "$CLEANED_UP" -eq 0 ]; then
         CLEANED_UP=1
         if ! teardown && [ "$status" -eq 0 ]; then
@@ -237,10 +282,16 @@ cleanup() {
 }
 
 # Exits instead of returning, so the run does not resume after the trap; the
-# EXIT trap then tears down. bash runs this once the foreground command ends.
+# EXIT trap then tears down. `run` steps are interrupted at once, so this
+# ends the step first; before that trap is armed there is nothing to tear down.
 on_signal() {
-    log "caught $1, tearing down"
+    log "caught $1, stopping"
+    stop_child
     exit "$2"
+}
+
+on_teardown_signal() {
+    log "caught $1 during teardown, finishing teardown first"
 }
 
 # Calls stack-check once and leaves its text in CHECK_OUT. Its exit status is
@@ -286,10 +337,10 @@ step_build_and_start_agent() {
     # build.sh keeps its clean-checkout rule and git archive; the overlay
     # makes it build the :smoke image directly, so a smoke run never writes
     # or retags the developer's :local image.
-    DERHOST_BUILD_OVERLAY="$SCRIPT_DIR/$dir/compose.smoke.yml" timeout "$BUILD_TIMEOUT" bash "$SCRIPT_DIR/$dir/build.sh" ||
-        die "build.sh failed for $dir"
+    run env "DERHOST_BUILD_OVERLAY=$SCRIPT_DIR/$dir/compose.smoke.yml" timeout -k "$KILL_GRACE" "$BUILD_TIMEOUT" \
+        bash "$SCRIPT_DIR/$dir/build.sh" || die "build.sh failed for $dir"
     log "up $dir"
-    agent_compose "$dir" "$STEP_TIMEOUT" up -d --no-build --wait --wait-timeout "$WAIT_TIMEOUT"
+    agent_compose_run "$dir" "$STEP_TIMEOUT" up -d --no-build --wait --wait-timeout "$WAIT_TIMEOUT"
 }
 
 # Issue 96's job probes run here, once both agents are connected and before
@@ -325,31 +376,35 @@ step_restart() {
 }
 
 main() {
+    # Caught from before the first compose call: a signal at any later step,
+    # the builds included, ends the run with its status.
+    trap 'on_signal INT 130' INT
+    trap 'on_signal TERM 143' TERM
+
     validate_agent_dirs
 
     log "config -q"
-    timeout "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" config -q
+    run timeout -k "$KILL_GRACE" "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" config -q
     local dir expected=""
     for dir in "${AGENTS[@]+"${AGENTS[@]}"}"; do
-        agent_compose "$dir" "$STEP_TIMEOUT" config -q
+        agent_compose_run "$dir" "$STEP_TIMEOUT" config -q
         expected="$expected${expected:+,}$(agent_identity "$dir")"
     done
 
     refuse_if_leftover_exists
 
+    # Armed before the first step that creates anything, not after it
+    # returns: a stack this run never created must never be torn down (config
+    # and the leftover check above both fail before this line), but a partial
+    # failure or a signal inside `build` or `up` (an image, a network or a
+    # volume created before the step ends) must still be cleaned up.
+    trap cleanup EXIT
+
     log "build"
-    timeout "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" build
+    run timeout -k "$KILL_GRACE" "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" build
 
     log "up"
-    # Armed before `up` is invoked, not after it returns: a stack this run
-    # never created must never be torn down (config and the leftover check
-    # above both fail before this line), but a partial failure inside `up`
-    # itself (a network or volume created before the container fails to
-    # start) must still be cleaned up.
-    trap cleanup EXIT
-    trap 'on_signal INT 130' INT
-    trap 'on_signal TERM 143' TERM
-    timeout "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" up -d --wait --wait-timeout "$WAIT_TIMEOUT"
+    run timeout -k "$KILL_GRACE" "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" up -d --wait --wait-timeout "$WAIT_TIMEOUT"
 
     log "check"
     local port

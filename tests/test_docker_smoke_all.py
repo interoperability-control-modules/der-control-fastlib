@@ -19,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -82,8 +83,21 @@ if [ "${1-}" = "compose" ]; then
         *" config "*) exec "$STUB_REAL_DOCKER" compose "$@" ;;
         *" port "*) printf '%s\\n' "$STUB_PORT_OUTPUT" ;;
         *" up "*) exit "${STUB_UP_EXIT:-0}" ;;
-        *" down "*) exit "${STUB_DOWN_EXIT:-0}" ;;
-        *" build "*) exit 0 ;;
+        *" down "*)
+            # Signals the running smoke.sh once, at the first logged `down`,
+            # then returns normally: a trap runs once the foreground step ends.
+            if [ -n "${STUB_SIGNAL_FIRST_DOWN-}" ] && [ "$(/usr/bin/grep -c ' down ' "$STUB_LOG")" -eq 1 ]; then
+                kill "-$STUB_SIGNAL_FIRST_DOWN" "$(cat "$STUB_SMOKE_PIDFILE")"
+            fi
+            exit "${STUB_DOWN_EXIT:-0}" ;;
+        *" build "*)
+            # A server build that signals smoke.sh and then runs far longer than
+            # any test waits, so only a prompt reaction ends the run in time.
+            if [ -n "${STUB_SIGNAL_SERVER_BUILD-}" ]; then
+                kill "-$STUB_SIGNAL_SERVER_BUILD" "$(cat "$STUB_SMOKE_PIDFILE")"
+                exec sleep 25
+            fi
+            exit 0 ;;
         *) echo "stub: unexpected docker compose invocation: $*" >&2; exit 1 ;;
     esac
 elif [ "${1-}" = "ps" ] || { [ "${1-}" = "network" ] && [ "${2-}" = "ls" ]; } || { [ "${1-}" = "volume" ] && [ "${2-}" = "ls" ]; }; then
@@ -542,6 +556,58 @@ def test_a_signal_tears_down_and_ends_the_run_with_its_status(
     assert {_flag_value(c, "-p") for c in _compose_calls(calls, "up")} == {"derhost-smoke"}, calls
     # Teardown ran for every project, and its count was taken.
     assert _down_projects(calls) == ALL_SMOKE_PROJECTS, calls
+    assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize(("signal_name", "status"), [("INT", 130), ("TERM", 143)])
+def test_a_signal_during_the_server_build_is_acted_on_at_once_and_nothing_later_runs(
+    smoke_tree: Path, stub_env: dict[str, str], signal_name: str, status: int
+) -> None:
+    # The stub's build outlasts the 15 s bound by 10 s: a run that waits for the
+    # step to end instead of reacting to the signal fails the bound.
+    stub_env["STUB_SIGNAL_SERVER_BUILD"] = signal_name
+    started = time.monotonic()
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    elapsed = time.monotonic() - started
+    assert result.returncode == status, result.stdout + result.stderr
+    assert elapsed < 15, elapsed
+    assert "smoke passed" not in result.stdout
+    calls = _log_calls(stub_env)
+    assert not [c for c in calls if c[0] == "build.sh"], calls
+    assert not _compose_calls(calls, "up"), calls
+    assert _down_projects(calls) == ALL_SMOKE_PROJECTS, calls
+    assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+
+
+# --- a second signal during teardown (#95). ---------------------------------
+
+
+@pytest.mark.parametrize("second", ["INT", "TERM"])
+def test_a_second_signal_during_teardown_is_ignored_until_teardown_finishes(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer, second: str
+) -> None:
+    # The first TERM comes from the first agent's build; the second arrives at
+    # the first `down` of the teardown that follows it.
+    stub_env["STUB_SIGNAL_FIRST_DOWN"] = second
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS), signal_at=(AGENTS[0], "TERM"))
+    assert result.returncode == 143, result.stdout + result.stderr
+    assert f"caught {second} during teardown" in result.stdout, result.stdout
+    calls = _log_calls(stub_env)
+    downs = [_flag_value(c, "-p") for c in _compose_calls(calls, "down")]
+    assert sorted(downs) == sorted(ALL_SMOKE_PROJECTS), downs
+    assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+
+
+def test_a_signal_at_the_first_down_of_the_success_path_still_tears_every_project_down(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    # The signal ends the run mid-teardown, so the teardown has not finished
+    # when the exit trap runs; it must run again rather than be skipped.
+    stub_env["STUB_SIGNAL_FIRST_DOWN"] = "TERM"
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    assert result.returncode == 143, result.stdout + result.stderr
+    assert "smoke passed" not in result.stdout
+    assert _down_projects(_log_calls(stub_env)) == ALL_SMOKE_PROJECTS
     assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
 
 
