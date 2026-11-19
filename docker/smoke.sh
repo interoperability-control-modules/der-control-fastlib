@@ -391,13 +391,6 @@ step_restart() {
     log "StartedAt changed: $before -> $after"
 }
 
-# One smoke run per host at a time: the project, network and `:smoke` image
-# names are per daemon, so two runs would each tear down the other's objects
-# and read that as their own defect (#85). The lock lives on the open file
-# description, so the kernel drops it on every exit path, SIGKILL included;
-# no trap has to release it. A run that cannot lock refuses before it makes
-# its first docker call, and a missing flock refuses rather than running
-# unlocked.
 # The default is one fixed path, not a per-session directory: a daemon is
 # shared by every user, sudo and cron, and cron has no XDG_RUNTIME_DIR, so a
 # per-session default let exactly those runs overlap (#143).
@@ -405,19 +398,25 @@ smoke_lock_path() {
     printf '%s' "${DERHOST_SMOKE_LOCK:-/tmp/derhost-smoke.lock}"
 }
 
+# One smoke run per host at a time: the project, network and `:smoke` image
+# names are per daemon, so two runs would each tear down the other's objects
+# and read that as their own defect (#85). The lock lives on the open file
+# description, so the kernel drops it on every exit path, SIGKILL included;
+# no trap has to release it. A run that cannot lock refuses before it makes
+# its first docker call, and a missing flock refuses rather than running
+# unlocked.
 acquire_run_lock() {
-    local lock old_umask
+    local lock
     lock="$(smoke_lock_path)"
     command -v flock >/dev/null 2>&1 || die "flock is required to serialize smoke runs and is not on PATH"
-    # A mode-0666 file lets a second user open it and be refused by the lock,
-    # not by a permission error.
-    old_umask="$(umask)"
-    umask 0
+    # Opening a FIFO for write blocks, and a symlink is followed to wherever
+    # it points, so the path must be absent or a plain file before it is opened.
+    if [ -L "$lock" ] || { [ -e "$lock" ] && [ ! -f "$lock" ]; }; then
+        die "the smoke lock $lock must be a plain file (not a symlink, FIFO or directory)"
+    fi
     if ! exec 9>>"$lock"; then
-        umask "$old_umask"
         die "cannot open the smoke lock $lock"
     fi
-    umask "$old_umask"
     flock -n 9 || die "another smoke run holds $lock"
 }
 

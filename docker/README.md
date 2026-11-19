@@ -116,16 +116,19 @@ never written, retagged or removed. `derhost-base:local` is the exception: each
 agent image builds on it, so a run builds it when it is missing and leaves it
 (and any `:local` image) in place; only the `:smoke` tags are removed.
 
-Only one smoke run goes at a time on a host, whoever starts it: `smoke.sh`
-takes an exclusive `flock` on `/tmp/derhost-smoke.lock` right after it checks
-its inputs and before its first docker call, and a second run stops with
-"another smoke run holds <path>". The file is created world-writable so a
-second user is refused by the lock, not by a permission error. Set
-`DERHOST_SMOKE_LOCK` to use another path. A pre-planted symlink at the default
-path is followed only where `fs.protected_symlinks` is off. The lock is released
-when the run ends by any route, but a killed run's lock stays held until its
-child steps exit. A host without `flock` refuses to run rather than running
-unlocked.
+Only one smoke run goes at a time per host, whoever starts it: `smoke.sh`
+takes an exclusive `flock` on the fixed path `/tmp/derhost-smoke.lock` right
+after it checks its inputs and before its first docker call, and a second run
+stops with "another smoke run holds <path>". The file is created with the
+caller's umask. A second user's run is refused by the lock or, where
+`fs.protected_regular` blocks opening another user's file in `/tmp`, by a
+permission error; either way it makes no docker call. Any local user can block
+default-path runs by holding the lock or by planting a file at that path, and
+`DERHOST_SMOKE_LOCK` points a run at another path. A lock path that is a
+symlink (followed wherever it points, whoever owns the link), a FIFO or a
+directory is refused before it is opened. The lock is released when the run
+ends by any route, but a killed run's lock stays held until its child steps
+exit. A host without `flock` refuses to run rather than running unlocked.
 
 `INT` and `TERM` run the teardown and end the run with status 130 and 143. They
 are caught from before the first compose call. The config, build and up steps,

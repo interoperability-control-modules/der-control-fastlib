@@ -623,7 +623,7 @@ def test_the_default_smoke_lock_is_one_fixed_path_whatever_xdg_runtime_dir_says(
     assert override.stdout == stub_env["DERHOST_SMOKE_LOCK"]
 
 
-def test_a_new_smoke_lock_file_is_openable_by_other_users(
+def test_a_new_smoke_lock_file_is_created_with_the_callers_umask_not_world_writable(
     smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
 ) -> None:
     lock = Path(stub_env["DERHOST_SMOKE_LOCK"])
@@ -634,7 +634,46 @@ def test_a_new_smoke_lock_file_is_openable_by_other_users(
         _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
     finally:
         os.umask(old_umask)
-    assert stat.S_IMODE(lock.stat().st_mode) == 0o666
+    mode = stat.S_IMODE(lock.stat().st_mode)
+    assert mode == 0o644, oct(mode)
+    assert not mode & stat.S_IWOTH
+
+
+def _assert_lock_path_refused(
+    smoke_tree: Path, stub_env: dict[str, str], result: subprocess.CompletedProcess[str]
+) -> None:
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "must be a plain file" in result.stdout + result.stderr, result.stdout + result.stderr
+    assert Path(stub_env["STUB_LOG"]).read_text() == ""
+
+
+def test_a_smoke_lock_path_that_is_a_symlink_is_refused_before_any_docker_call(
+    smoke_tree: Path, stub_env: dict[str, str], tmp_path: Path
+) -> None:
+    target = tmp_path / "elsewhere"
+    target.write_text("keep\n")
+    Path(stub_env["DERHOST_SMOKE_LOCK"]).symlink_to(target)
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    _assert_lock_path_refused(smoke_tree, stub_env, result)
+    assert target.read_text() == "keep\n"
+
+
+def test_a_smoke_lock_path_that_is_a_fifo_is_refused_not_waited_on(
+    smoke_tree: Path, stub_env: dict[str, str]
+) -> None:
+    # Opening a FIFO for write blocks until a reader appears, so a short
+    # timeout turns a hang into a failure instead of a stalled suite.
+    os.mkfifo(stub_env["DERHOST_SMOKE_LOCK"])
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS), timeout=10)
+    _assert_lock_path_refused(smoke_tree, stub_env, result)
+
+
+def test_a_smoke_lock_path_that_is_a_directory_is_refused_before_any_docker_call(
+    smoke_tree: Path, stub_env: dict[str, str]
+) -> None:
+    Path(stub_env["DERHOST_SMOKE_LOCK"]).mkdir()
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    _assert_lock_path_refused(smoke_tree, stub_env, result)
 
 
 @pytest.mark.parametrize("reserved", ["server", "smoke", "interoperability-service server"])
@@ -742,7 +781,11 @@ def test_smoke_builds_the_smoke_image_directly_and_never_touches_local(
 
 
 def _smoke_sh(
-    tree: Path, env: dict[str, str], dirs: str, signal_at: tuple[str, str] | None = None
+    tree: Path,
+    env: dict[str, str],
+    dirs: str,
+    signal_at: tuple[str, str] | None = None,
+    timeout: float = 60,
 ) -> subprocess.CompletedProcess[str]:
     """Runs smoke.sh directly as a process whose pid the build stub can signal."""
     run_env = {**env, "DERHOST_SMOKE_AGENT_DIRS": dirs, "STUB_SMOKE_PIDFILE": str(tree.parent / "smoke.pid")}
@@ -755,7 +798,7 @@ def _smoke_sh(
         env=run_env,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=timeout,
         check=False,
     )
 
