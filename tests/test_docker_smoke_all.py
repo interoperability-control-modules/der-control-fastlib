@@ -11,6 +11,7 @@ what compose resolves, not about what the stub is told.
 
 from __future__ import annotations
 
+import fcntl
 import http.server
 import json
 import os
@@ -42,6 +43,7 @@ _SMOKE_ENV_KEYS = (
     "DER_AGENT_SRC",
     "AGENT_DIRS",
     "COMPOSE_PROJECT_NAME",
+    "DERHOST_SMOKE_LOCK",
 )
 
 _DOCKER_STUB = """#!/usr/bin/env bash
@@ -282,6 +284,7 @@ def stub_env(tmp_path: Path) -> dict[str, str]:
             "STUB_LOG": str(log),
             "STUB_REAL_DOCKER": real_docker,
             "STUB_PORT_OUTPUT": "127.0.0.1:1",
+            "DERHOST_SMOKE_LOCK": str(tmp_path / "smoke.lock"),
             "DERHOST_SMOKE_STEP_TIMEOUT": "30",
             "DERHOST_SMOKE_POLL_SECS": "0.1",
             "DERHOST_SMOKE_RESTART_WINDOW": "3",
@@ -543,6 +546,46 @@ def test_a_leftover_smoke_label_refuses_before_any_build(
     assert not [c for c in calls if c[0] == "build.sh"], calls
     for sub in ("build", "up", "down"):
         assert not _compose_calls(calls, sub), (sub, calls)
+
+
+# --- one smoke run per host at a time (#85). ---------------------------------
+
+
+def test_a_held_smoke_lock_refuses_before_any_docker_call(smoke_tree: Path, stub_env: dict[str, str]) -> None:
+    with Path(stub_env["DERHOST_SMOKE_LOCK"]).open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "another smoke run" in result.stdout + result.stderr, result.stdout + result.stderr
+    assert Path(stub_env["STUB_LOG"]).read_text() == ""
+
+
+def _lock_is_free(env: dict[str, str]) -> bool:
+    with Path(env["DERHOST_SMOKE_LOCK"]).open("a") as probe:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+
+def test_the_smoke_lock_is_released_when_a_run_ends(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    # Control: the held-lock test above shows the lock is real, and this
+    # checks the probe can see a lock at all, so "free" below is not vacuous.
+    with Path(stub_env["DERHOST_SMOKE_LOCK"]).open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert not _lock_is_free(stub_env)
+    stub_env["STUB_SIGNAL_SERVER_BUILD"] = "TERM"
+    ended_by_signal = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    assert ended_by_signal.returncode == 143, ended_by_signal.stdout + ended_by_signal.stderr
+    assert _lock_is_free(stub_env)
+    del stub_env["STUB_SIGNAL_SERVER_BUILD"]
+    stub_env["STUB_LEFTOVER_PROJECT"] = "derhost-smoke"
+    refused = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    assert "[smoke] refusing" in refused.stdout, refused.stdout
+    assert _lock_is_free(stub_env)
 
 
 @pytest.mark.parametrize("reserved", ["server", "smoke", "interoperability-service server"])
@@ -1045,8 +1088,8 @@ def test_the_readme_names_every_smoke_timeout_and_the_local_images_it_keeps() ->
     smoke_sh = (DOCKER_DIR / "smoke.sh").read_text(encoding="utf-8")
     readme = (DOCKER_DIR / "README.md").read_text(encoding="utf-8")
     knobs = sorted(set(re.findall(r"\$\{(DERHOST_SMOKE_[A-Z_]+):-", smoke_sh)))
-    # Not vacuous: the four timeouts, the restart window and the poll interval.
-    assert len(knobs) == 5, knobs
+    # Not vacuous: the four timeouts, the restart window, the poll interval and the lock path.
+    assert len(knobs) == 6, knobs
     for knob in knobs:
         assert knob in readme, knob
     assert "derhost-base:local" in readme

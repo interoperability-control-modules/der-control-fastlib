@@ -25,7 +25,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STACK_PORT = 5410
 
-_OVERRIDE_KEYS = ("DERHOST_PUBLISH_HOST", "EXPECTED", "DERHOST_CHECK_BASE_URL", "C")
+_OVERRIDE_KEYS = ("DERHOST_PUBLISH_HOST", "EXPECTED", "DERHOST_CHECK_BASE_URL", "C", "AGENT_DIRS", "SERVER_PROJECT_NAME")
 
 # When this suite runs under `make test`, the outer make exports MAKELEVEL
 # and MAKEFLAGS to pytest's own environment; a `make` subprocess that
@@ -201,14 +201,17 @@ def test_preflight_agrees_with_compose_when_env_is_set_empty_over_env_file() -> 
 # name. Swept: DERHOST_PUBLISH_HOST, C, EXPECTED, DERHOST_CHECK_BASE_URL
 # (the four caller-supplied names); `git grep` for `$(NAME)` inside
 # docker.mk finds no remaining reference to any of the four outside their
-# own declaration. AGENT_DIRS (#68) is fixed text this file itself
-# declares, not caller- or filesystem-derived, so it carries no such test.
+# own declaration. AGENT_DIRS and SERVER_PROJECT_NAME (#85) can also be set
+# on the command line: AGENT_DIRS is validated unexpanded at parse time and
+# SERVER_PROJECT_NAME is an `override`, so both are in the table below.
 
 _INJECTION_TARGET = {
     "DERHOST_PUBLISH_HOST": "stack-status",
     "C": "stack-up",
     "EXPECTED": "stack-check",
     "DERHOST_CHECK_BASE_URL": "stack-check",
+    "AGENT_DIRS": "stack-status",
+    "SERVER_PROJECT_NAME": "stack-status",
 }
 
 
@@ -227,6 +230,41 @@ def test_no_caller_value_is_make_expanded_via_command_line(tmp_path: Path, var_n
     result = _run_make(f"{var_name}={payload}", _INJECTION_TARGET[var_name])
     assert not marker.exists(), result.stdout + result.stderr
 
+
+# --- AGENT_DIRS and SERVER_PROJECT_NAME on the command line (#85). ----------
+
+
+@pytest.mark.parametrize("value", ["a;touch MARKER", "-x", "a b;c", "A", "a/b", "$(shell touch MARKER)", "a a"])
+def test_agent_dirs_with_a_shell_metacharacter_is_refused_before_any_docker_call(
+    docker_stub: Path, tmp_path: Path, value: str
+) -> None:
+    marker = tmp_path / "pwned-agent-dirs"
+    result = _run_make(f"AGENT_DIRS={value.replace('MARKER', str(marker))}", "stack-status")
+    assert result.returncode != 0, result.stdout
+    assert "invalid" in result.stderr, result.stderr
+    assert not marker.exists()
+    assert docker_stub.read_text() == ""
+
+
+@pytest.mark.parametrize("target", ["stack-up", "stack-down", "stack-status"])
+@pytest.mark.parametrize("reserved", ["server", "smoke"])
+def test_reserved_agent_dir_is_refused_for_every_stack_target(docker_stub: Path, target: str, reserved: str) -> None:
+    overrides = {"C": "all"} if target == "stack-up" else None
+    result = _run_make(f"AGENT_DIRS={reserved}", target, overrides=overrides)
+    assert result.returncode != 0, result.stdout
+    assert "reserved" in result.stderr, result.stderr
+    assert docker_stub.read_text() == ""
+
+
+def test_server_project_name_on_the_command_line_is_ignored(docker_stub: Path) -> None:
+    result = _run_make("SERVER_PROJECT_NAME=other", "stack-status")
+    assert result.returncode == 0, result.stderr
+    compose_calls = [c for c in _stub_calls(docker_stub.read_text()) if c and c[0] == "compose"]
+    assert compose_calls, "stack-status made no compose call"
+    projects = [_flag_value(c, "-p") for c in compose_calls]
+    assert "other" not in projects, projects
+    server_calls = [c for c in compose_calls if _flag_value(c, "--project-directory") == "docker/server"]
+    assert [_flag_value(c, "-p") for c in server_calls] == ["derhost-server"], compose_calls
 
 # --- stack-check: GET /connections against a stub server. -------------------
 
