@@ -11,6 +11,9 @@ file gets the same checks with no extra wiring.
 
 from __future__ import annotations
 
+import posixpath
+import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,37 @@ HEALTH_PATH = "/health"
 def discover_compose_files() -> list[Path]:
     """Every docker/<name>/docker-compose.yml under the repo root."""
     return sorted(DOCKER_DIR.glob("*/docker-compose.yml"))
+
+
+# Docker Compose reads compose.yaml, compose.yml, docker-compose.yaml,
+# docker-compose.yml and an override sitting beside any of them, and `-f` can
+# name any other file. Only the two names the rules below load are accepted;
+# a compose-shaped file under any other name would be read by Docker and
+# checked by nothing.
+_ACCEPTED_COMPOSE_NAMES = ("docker-compose.yml", "compose.smoke.yml")
+
+
+def _is_compose_shaped(name: str) -> bool:
+    lowered = name.lower()
+    if not lowered.endswith((".yml", ".yaml")):
+        return False
+    return "compose" in lowered or ".override." in lowered
+
+
+def check_compose_file_names(root: Path) -> list[Path]:
+    """Return the accepted compose files under root; refuse any other compose-shaped name."""
+    accepted: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or not _is_compose_shaped(path.name):
+            continue
+        if path.parent.parent == root and path.name in _ACCEPTED_COMPOSE_NAMES:
+            accepted.append(path)
+        else:
+            raise AssertionError(
+                f"{path}: compose file name not accepted; only docker/<name>/"
+                f"{' and docker/<name>/'.join(_ACCEPTED_COMPOSE_NAMES)} are checked"
+            )
+    return accepted
 
 
 class _ComposeLoader(yaml.SafeLoader):
@@ -108,9 +142,27 @@ def test_server_internal_bind_is_all_interfaces() -> None:
 # --- Rule 2: no Docker socket mount, and no /var/run or /run mount. ---------
 
 
+def _normalize_host_path(raw: str) -> str:
+    path = posixpath.normpath(raw)
+    # normpath keeps a leading "//" as is; POSIX reads it as "/".
+    return "/" + path.lstrip("/") if path.startswith("/") else path
+
+
+def _host_paths(service: dict[str, Any]) -> Iterator[tuple[Any, str]]:
+    """(volume entry, normalized host path) for each short-form and long-form
+    volume that can name a host path. Named volumes pass through unchanged."""
+    for volume in service.get("volumes") or []:
+        if isinstance(volume, dict):
+            if volume.get("type") in ("volume", "tmpfs", "image") or not volume.get("source"):
+                continue
+            yield volume, _normalize_host_path(str(volume["source"]))
+        else:
+            yield volume, _normalize_host_path(str(volume).split(":", 1)[0])
+
+
 def check_no_docker_socket(name: str, service: dict[str, Any]) -> None:
-    for volume in service.get("volumes", []):
-        if "docker.sock" in str(volume):
+    for volume, host_path in _host_paths(service):
+        if "docker.sock" in host_path or "docker.sock" in str(volume):
             raise AssertionError(f"{name}: mounts the Docker socket: {volume!r}")
 
 
@@ -125,10 +177,10 @@ def test_no_docker_socket_mount_fixture_fails() -> None:
 
 
 def check_no_var_run_mount(name: str, service: dict[str, Any]) -> None:
-    for volume in service.get("volumes", []):
-        host_path = str(volume).split(":", 1)[0]
-        if host_path in ("/var/run", "/run") or host_path.startswith(("/var/run/", "/run/")):
-            raise AssertionError(f"{name}: mounts a host runtime directory: {volume!r}")
+    for volume, host_path in _host_paths(service):
+        # "/" and "/var" contain the runtime directories, so mounting them reaches the socket.
+        if host_path in ("/", "/var", "/var/run", "/run") or host_path.startswith(("/var/run/", "/run/")):
+            raise AssertionError(f"{name}: mounts a host runtime directory or a parent of one: {volume!r}")
 
 
 def test_no_var_run_mount() -> None:
@@ -141,6 +193,56 @@ def test_no_var_run_mount_fixture_fails() -> None:
     # the socket without naming it.
     with pytest.raises(AssertionError, match="host runtime directory"):
         check_no_var_run_mount(SERVER_SERVICE, {"volumes": ["/var/run:/var/run"]})
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        {"type": "bind", "source": "/var/run", "target": "/x"},
+        {"type": "bind", "source": "/run", "target": "/x"},
+        {"type": "bind", "source": "/", "target": "/x"},
+        "/:/host",
+        "/var:/v:ro",
+        "/var/run/../run:/r",
+        "//var/run:/r",
+        "/var/./run/sub:/r",
+    ],
+)
+def test_runtime_and_root_mounts_fail_in_both_volume_forms(volume: Any) -> None:
+    with pytest.raises(AssertionError, match="host runtime directory"):
+        check_no_var_run_mount(SERVER_SERVICE, {"volumes": [volume]})
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        {"type": "bind", "source": "/var/run/docker.sock", "target": "/x"},
+        "/var/./run/docker.sock:/s",
+        "/run/../var/run/docker.sock:/s:ro",
+        "/srv/docker.sock:/s",
+    ],
+)
+def test_docker_socket_mounts_fail_in_both_volume_forms(volume: Any) -> None:
+    with pytest.raises(AssertionError, match="Docker socket"):
+        check_no_docker_socket(SERVER_SERVICE, {"volumes": [volume]})
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        "derhost-home:/var/volttron",
+        {"type": "volume", "source": "derhost-home", "target": "/var/volttron"},
+        "./data:/data:ro",
+        {"type": "tmpfs", "target": "/tmp"},
+        "/var/lib/derhost:/data",
+    ],
+)
+def test_ordinary_mounts_pass_the_mount_rules(volume: Any) -> None:
+    # Control: the normalizer must not turn a named volume or an unrelated
+    # host path into a refusal.
+    service = {"volumes": [volume]}
+    check_no_var_run_mount(SERVER_SERVICE, service)
+    check_no_docker_socket(SERVER_SERVICE, service)
 
 
 # --- Rule 3: non-root user 1000, every service. ------------------------------
@@ -218,11 +320,35 @@ def test_not_privileged_fixture_fails() -> None:
 # --- Rule 4d: no host network or PID namespace, every service. --------------
 
 
+_UNCONFINED_SECURITY_OPTS = tuple(
+    f"{kind}{sep}{value}"
+    for kind, value in (
+        ("seccomp", "unconfined"),
+        ("apparmor", "unconfined"),
+        ("label", "disable"),
+        ("systempaths", "unconfined"),
+    )
+    for sep in ("=", ":")
+)
+
+
 def check_no_host_namespace(name: str, service: dict[str, Any]) -> None:
     if service.get("network_mode") == "host":
         raise AssertionError(f"{name}: network_mode: host must not be set")
     if service.get("pid") == "host":
         raise AssertionError(f"{name}: pid: host must not be set")
+    for key in ("ipc", "userns_mode", "uts", "cgroup"):
+        if service.get(key) == "host":
+            raise AssertionError(f"{name}: {key}: host must not be set")
+    for key in ("network_mode", "pid", "ipc"):
+        if str(service.get(key) or "").startswith(("container:", "service:")):
+            raise AssertionError(f"{name}: {key}: {service[key]} joins another container's namespace")
+    for option in service.get("security_opt") or []:
+        if str(option).strip().lower() in _UNCONFINED_SECURITY_OPTS:
+            raise AssertionError(f"{name}: security_opt {option} disables a confinement profile")
+    for key in ("devices", "device_cgroup_rules"):
+        if service.get(key):
+            raise AssertionError(f"{name}: {key} must not be set, got {service[key]!r}")
 
 
 def test_no_host_namespace() -> None:
@@ -238,6 +364,47 @@ def test_no_host_namespace_fixture_fails_network() -> None:
 def test_no_host_namespace_fixture_fails_pid() -> None:
     with pytest.raises(AssertionError, match="pid"):
         check_no_host_namespace(SERVER_SERVICE, {"pid": "host"})
+
+
+@pytest.mark.parametrize(
+    ("service", "needle"),
+    [
+        ({"security_opt": ["seccomp=unconfined"]}, "seccomp=unconfined"),
+        ({"security_opt": ["seccomp:unconfined"]}, "seccomp:unconfined"),
+        ({"security_opt": ["apparmor=unconfined"]}, "apparmor=unconfined"),
+        ({"security_opt": ["apparmor:unconfined"]}, "apparmor:unconfined"),
+        ({"security_opt": ["label=disable"]}, "label=disable"),
+        ({"security_opt": ["label:disable"]}, "label:disable"),
+        ({"security_opt": ["no-new-privileges:true", "systempaths=unconfined"]}, "systempaths=unconfined"),
+        ({"ipc": "host"}, "ipc"),
+        ({"userns_mode": "host"}, "userns_mode"),
+        ({"uts": "host"}, "uts"),
+        ({"cgroup": "host"}, "cgroup"),
+        ({"network_mode": "container:other"}, "network_mode"),
+        ({"network_mode": "service:other"}, "network_mode"),
+        ({"pid": "container:other"}, "pid"),
+        ({"pid": "service:other"}, "pid"),
+        ({"ipc": "service:other"}, "ipc"),
+        ({"devices": ["/dev/mem:/dev/mem"]}, "devices"),
+        ({"device_cgroup_rules": ["c 1:3 mr"]}, "device_cgroup_rules"),
+    ],
+)
+def test_no_host_namespace_fixture_fails_every_confinement_escape(service: dict[str, Any], needle: str) -> None:
+    with pytest.raises(AssertionError, match=needle):
+        check_no_host_namespace(SERVER_SERVICE, service)
+
+
+def test_no_host_namespace_fixture_passes_a_confined_service() -> None:
+    # Control: the parametrized refusals above are not a blanket refusal.
+    check_no_host_namespace(
+        SERVER_SERVICE,
+        {
+            "security_opt": ["no-new-privileges:true"],
+            "network_mode": "bridge",
+            "ipc": "private",
+            "devices": [],
+        },
+    )
 
 
 # --- Rule 4e: no env_file, every service. ------------------------------------
@@ -415,10 +582,46 @@ def _looks_like_secret_key(key: str) -> bool:
     return any(marker in upper for marker in _SECRET_KEY_MARKERS)
 
 
+_SECRETS_DIR = "/run/secrets/"
+_NUMERIC_SUFFIXES = ("MINUTES", "SECONDS", "HOURS", "DAYS", "TTL", "COUNT", "LENGTH")
+_BOOLEAN_SUFFIXES = ("ENABLED", "REQUIRED")
+
+
+def _declared_secret_names(service: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for entry in service.get("secrets") or []:
+        if isinstance(entry, dict):
+            names.add(str(entry.get("target") or entry.get("source")))
+        else:
+            names.add(str(entry))
+    return names
+
+
+def _is_declared_secret_file(key: str, value: str, service: dict[str, Any]) -> bool:
+    if not key.upper().endswith("_FILE") or "$" in value or posixpath.normpath(value) != value:
+        return False
+    if not value.startswith(_SECRETS_DIR):
+        return False
+    secret = value[len(_SECRETS_DIR) :]
+    return bool(secret) and "/" not in secret and secret in _declared_secret_names(service)
+
+
+def _is_config_shaped(key: str, value: str) -> bool:
+    suffix = key.upper().rsplit("_", 1)[-1]
+    if suffix in _NUMERIC_SUFFIXES:
+        return re.fullmatch(r"[0-9]+", value) is not None
+    if suffix in _BOOLEAN_SUFFIXES:
+        return value.lower() in ("true", "false", "0", "1")
+    return False
+
+
 def check_no_secret_env(name: str, service: dict[str, Any]) -> None:
-    for key in _env_mapping(service):
-        if _looks_like_secret_key(key):
-            raise AssertionError(f"{name}: {key} must not be a literal environment value")
+    for key, value in _env_mapping(service).items():
+        if not _looks_like_secret_key(key):
+            continue
+        if _is_declared_secret_file(key, value, service) or _is_config_shaped(key, value):
+            continue
+        raise AssertionError(f"{name}: {key} must not be a literal environment value")
 
 
 def test_no_secret_env() -> None:
@@ -441,6 +644,97 @@ def test_no_secret_env_fixture_fails_password() -> None:
     # A differently named secret must be caught too, not only JWT_SECRET_KEY.
     with pytest.raises(AssertionError, match="DB_PASSWORD"):
         check_no_secret_env(SERVER_SERVICE, {"environment": {"DB_PASSWORD": "not-a-real-secret"}})
+
+
+@pytest.mark.parametrize(
+    ("environment", "secrets"),
+    [
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt_secret_key"}, ["jwt_secret_key"]),
+        (["JWT_SECRET_KEY_FILE=/run/secrets/jwt_secret_key"], ["jwt_secret_key"]),
+        ({"DB_PASSWORD_FILE": "/run/secrets/db_password"}, [{"source": "db", "target": "db_password"}]),
+        ({"DB_PASSWORD_FILE": "/run/secrets/db"}, [{"source": "db"}]),
+        ({"ACCESS_TOKEN_EXPIRE_MINUTES": "30"}, []),
+        (["ACCESS_TOKEN_EXPIRE_MINUTES=30"], []),
+        ({"ACCESS_TOKEN_EXPIRE_MINUTES": 30}, []),
+        ({"TOKEN_CACHE_ENABLED": "true"}, []),
+        ({"TOKEN_CACHE_ENABLED": True}, []),
+        ({"VOLTTRON_HOME": "/var/volttron"}, []),
+    ],
+)
+def test_secret_env_allowances_pass(environment: Any, secrets: list[Any]) -> None:
+    check_no_secret_env(SERVER_SERVICE, {"environment": environment, "secrets": secrets})
+
+
+@pytest.mark.parametrize(
+    ("environment", "secrets", "key"),
+    [
+        ({"JWT_SECRET_KEY": "not-a-real-secret"}, ["jwt_secret_key"], "JWT_SECRET_KEY"),
+        ({"JWT_SECRET_KEY_FILE": "/etc/jwt"}, ["jwt"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/../etc/shadow"}, ["shadow"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/"}, [""], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/a/b"}, ["a/b"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "${JWT_PATH}"}, ["jwt"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, [], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, ["other"], "JWT_SECRET_KEY_FILE"),
+        ({"ACCESS_TOKEN_EXPIRE_MINUTES": "abcdef"}, [], "ACCESS_TOKEN_EXPIRE_MINUTES"),
+        ({"ACCESS_TOKEN_EXPIRE_MINUTES": "${MINUTES}"}, [], "ACCESS_TOKEN_EXPIRE_MINUTES"),
+        ({"TOKEN_CACHE_ENABLED": "maybe"}, [], "TOKEN_CACHE_ENABLED"),
+        ({"SECRET_FILE_PATH": "/run/secrets/x"}, ["x"], "SECRET_FILE_PATH"),
+        ({"DB_PASSWORD": "${DB_PASSWORD}"}, [], "DB_PASSWORD"),
+        (["DB_PASSWORD"], [], "DB_PASSWORD"),
+    ],
+)
+def test_secret_env_violations_fail(environment: Any, secrets: list[Any], key: str) -> None:
+    # Control for the allowances: none of them opens the rule for a value that
+    # is not a declared secret file or a number or boolean.
+    with pytest.raises(AssertionError, match=key):
+        check_no_secret_env(SERVER_SERVICE, {"environment": environment, "secrets": secrets})
+
+
+# --- Rule 13: every compose file name Docker would read is checked (#75). ----
+
+
+def _touch(root: Path, *relative: str) -> None:
+    for entry in relative:
+        target = root / entry
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("services: {}\n", encoding="utf-8")
+
+
+def test_every_compose_file_name_under_docker_is_accepted() -> None:
+    accepted = check_compose_file_names(DOCKER_DIR)
+    assert sorted(p.name for p in accepted) == ["compose.smoke.yml"] * 3 + ["docker-compose.yml"] * 3, accepted
+    assert [p for p in accepted if p.name == "docker-compose.yml"] == discover_compose_files()
+    assert [p for p in accepted if p.name == "compose.smoke.yml"] == discover_overlay_files()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "x/compose.yaml",
+        "x/compose.yml",
+        "x/docker-compose.yaml",
+        "x/docker-compose.override.yml",
+        "x/docker-compose.override.yaml",
+        "x/prod.override.yml",
+        "x/Compose.YML",
+        "x/compose.prod.yml",
+        "x/deeper/docker-compose.yml",
+        "compose.yml",
+        "docker-compose.yml",
+    ],
+)
+def test_a_compose_file_under_another_name_or_place_is_refused(tmp_path: Path, relative: str) -> None:
+    _touch(tmp_path, "x/docker-compose.yml", "x/compose.smoke.yml", relative)
+    with pytest.raises(AssertionError, match="not accepted") as excinfo:
+        check_compose_file_names(tmp_path)
+    assert Path(relative).name in str(excinfo.value)
+
+
+def test_a_tree_of_accepted_names_passes_discovery(tmp_path: Path) -> None:
+    # Control: the refusals above come from the names, not from the fixture tree.
+    _touch(tmp_path, "x/docker-compose.yml", "x/compose.smoke.yml", "x/Dockerfile", "x/notes.yml")
+    assert [p.name for p in check_compose_file_names(tmp_path)] == ["compose.smoke.yml", "docker-compose.yml"]
 
 
 # --- Regression: the review's agent mutant (M11) must be rejected. ----------
