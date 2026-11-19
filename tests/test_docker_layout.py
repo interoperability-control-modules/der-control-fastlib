@@ -511,6 +511,27 @@ def check_overlay_sets_only_allowed_keys(name: str, service: dict[str, Any], all
             )
 
 
+# The same allow-list one level up: a top-level `volumes:` or a network
+# `driver:` would rename or retarget an object the smoke run must keep apart
+# from the developer's stack-up objects.
+_OVERLAY_TOP_LEVEL_KEYS = ("name", "services", "networks")
+_OVERLAY_NETWORK_KEYS = ("name", "external")
+
+
+def check_overlay_top_level_keys(path: Path, compose: dict[str, Any]) -> None:
+    for key in compose:
+        if key not in _OVERLAY_TOP_LEVEL_KEYS:
+            raise AssertionError(
+                f"{path}: an overlay may not set top-level {key}; allowed keys: {', '.join(_OVERLAY_TOP_LEVEL_KEYS)}"
+            )
+    for network, entry in (compose.get("networks") or {}).items():
+        for key in entry or {}:
+            if key not in _OVERLAY_NETWORK_KEYS:
+                raise AssertionError(
+                    f"{path}: network {network} may not set {key}; allowed keys: {', '.join(_OVERLAY_NETWORK_KEYS)}"
+                )
+
+
 def discover_overlay_files() -> list[Path]:
     """Every docker/<name>/compose.smoke.yml under the repo root."""
     return sorted(DOCKER_DIR.glob("*/compose.smoke.yml"))
@@ -538,6 +559,7 @@ def check_overlay(path: Path, compose: dict[str, Any]) -> None:
             raise AssertionError(f"{name}: publishes a port; only {SERVER_SERVICE} may")
         allowed = _SERVER_OVERLAY_ALLOWED_KEYS if is_server else _OVERLAY_ALLOWED_KEYS
         check_overlay_sets_only_allowed_keys(name, service, allowed)
+    check_overlay_top_level_keys(path, compose)
     if not is_server and compose.get("name") != f"derhost-smoke-{directory}":
         raise AssertionError(f"{path}: expected name: derhost-smoke-{directory}, got {compose.get('name')!r}")
     network = (compose.get("networks") or {}).get("derhost-net") or {}
@@ -641,6 +663,31 @@ def test_the_server_overlay_may_set_ports_and_no_other_hardening_key(tmp_path: P
     assert marker in server_text
     overlay.write_text(server_text.replace(marker, marker + "    mem_limit: !reset null\n"), encoding="utf-8")
     with pytest.raises(AssertionError, match="may not set or reset mem_limit"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_a_server_overlay_with_a_top_level_volume_rename_fails(tmp_path: Path) -> None:
+    # The overlay that merged the smoke volume onto the developer's stack-up
+    # volume, which no service-key rule can see.
+    server_text = (DOCKER_DIR / "server" / "compose.smoke.yml").read_text(encoding="utf-8")
+    overlay = tmp_path / "server" / "compose.smoke.yml"
+    overlay.parent.mkdir()
+    overlay.write_text(
+        server_text + "\nvolumes:\n  derhost-home:\n    name: derhost-server_derhost-home\n", encoding="utf-8"
+    )
+    assert load_compose(overlay)["volumes"] == {"derhost-home": {"name": "derhost-server_derhost-home"}}
+    with pytest.raises(AssertionError, match="may not set top-level volumes"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_an_overlay_network_with_a_driver_fails(tmp_path: Path) -> None:
+    server_text = (DOCKER_DIR / "server" / "compose.smoke.yml").read_text(encoding="utf-8")
+    marker = "    name: derhost-smoke-net\n"
+    assert marker in server_text
+    overlay = tmp_path / "server" / "compose.smoke.yml"
+    overlay.parent.mkdir()
+    overlay.write_text(server_text.replace(marker, marker + "    driver: host\n"), encoding="utf-8")
+    with pytest.raises(AssertionError, match="network derhost-net may not set driver"):
         check_overlay(overlay, load_compose(overlay))
 
 
