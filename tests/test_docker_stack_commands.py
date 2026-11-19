@@ -246,6 +246,23 @@ def test_agent_dirs_with_a_shell_metacharacter_is_refused_before_any_docker_call
     assert docker_stub.read_text() == ""
 
 
+@pytest.mark.parametrize("separator", ["\t", "\r", "\n", "\f"])
+def test_agent_dirs_with_non_space_whitespace_is_refused_before_any_docker_call(
+    docker_stub: Path, separator: str
+) -> None:
+    result = _run_make(f"AGENT_DIRS=aa{separator}bb", "stack-status")
+    assert result.returncode != 0, result.stdout
+    assert "invalid" in result.stderr, result.stderr
+    assert docker_stub.read_text() == ""
+
+
+def test_agent_dirs_separated_by_spaces_still_passes(docker_stub: Path) -> None:
+    # Control for the refusals above: only the separator differs.
+    result = _run_make("AGENT_DIRS=aa bb", "stack-status")
+    assert "invalid" not in result.stderr, result.stderr
+    assert docker_stub.read_text() != ""
+
+
 @pytest.mark.parametrize("target", ["stack-up", "stack-down", "stack-status"])
 @pytest.mark.parametrize("reserved", ["server", "smoke"])
 def test_reserved_agent_dir_is_refused_for_every_stack_target(docker_stub: Path, target: str, reserved: str) -> None:
@@ -265,6 +282,18 @@ def test_server_project_name_on_the_command_line_is_ignored(docker_stub: Path) -
     assert "other" not in projects, projects
     server_calls = [c for c in compose_calls if _flag_value(c, "--project-directory") == "docker/server"]
     assert [_flag_value(c, "-p") for c in server_calls] == ["derhost-server"], compose_calls
+
+@pytest.mark.parametrize("name", ["DOCKER_DIR", "SERVER_COMPOSE", "SERVER_PROJECT_DIR"])
+def test_server_path_names_on_the_command_line_are_ignored(docker_stub: Path, name: str) -> None:
+    result = _run_make(f"{name}=zz-injected", "stack-status")
+    assert result.returncode == 0, result.stderr
+    log = docker_stub.read_text()
+    assert "zz-injected" not in log, log
+    server_calls = [
+        c for c in _compose_calls(_stub_calls(log), "ps") if _flag_value(c, "--project-directory") == "docker/server"
+    ]
+    assert [_flag_value(c, "-f") for c in server_calls] == ["docker/server/docker-compose.yml"], log
+
 
 # --- stack-check: GET /connections against a stub server. -------------------
 
