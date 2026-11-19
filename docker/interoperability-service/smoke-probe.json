@@ -1,0 +1,7 @@
+{
+  "identity": "platform.presentation",
+  "kind": "rpc",
+  "method": "lookup_transform",
+  "args": ["sunspec", "2030.5"],
+  "expect": {"type": "list", "min_length": 1}
+}
