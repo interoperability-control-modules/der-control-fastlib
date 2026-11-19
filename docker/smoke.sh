@@ -109,7 +109,7 @@ validate_agent_dirs() {
     fi
     # `read -a` takes only the first line, so a newline would silently drop
     # every name after it and still print "smoke passed".
-    if [[ "$DERHOST_SMOKE_AGENT_DIRS" == *[$'\n\r\t']* ]]; then
+    if [[ "$DERHOST_SMOKE_AGENT_DIRS" == *[$'\n\r\t\f']* ]]; then
         die "DERHOST_SMOKE_AGENT_DIRS must be one line of space-separated names"
     fi
     local dir seen=" "
@@ -398,10 +398,26 @@ step_restart() {
 # no trap has to release it. A run that cannot lock refuses before it makes
 # its first docker call, and a missing flock refuses rather than running
 # unlocked.
+# The default is one fixed path, not a per-session directory: a daemon is
+# shared by every user, sudo and cron, and cron has no XDG_RUNTIME_DIR, so a
+# per-session default let exactly those runs overlap (#143).
+smoke_lock_path() {
+    printf '%s' "${DERHOST_SMOKE_LOCK:-/tmp/derhost-smoke.lock}"
+}
+
 acquire_run_lock() {
-    local lock="${DERHOST_SMOKE_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/derhost-smoke.lock}"
+    local lock old_umask
+    lock="$(smoke_lock_path)"
     command -v flock >/dev/null 2>&1 || die "flock is required to serialize smoke runs and is not on PATH"
-    exec 9>>"$lock" || die "cannot open the smoke lock $lock"
+    # A mode-0666 file lets a second user open it and be refused by the lock,
+    # not by a permission error.
+    old_umask="$(umask)"
+    umask 0
+    if ! exec 9>>"$lock"; then
+        umask "$old_umask"
+        die "cannot open the smoke lock $lock"
+    fi
+    umask "$old_umask"
     flock -n 9 || die "another smoke run holds $lock"
 }
 
@@ -465,4 +481,7 @@ main() {
     log "smoke passed"
 }
 
-main "$@"
+# Sourced (for a test that reads smoke_lock_path), the script runs nothing.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
