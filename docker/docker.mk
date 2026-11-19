@@ -13,7 +13,9 @@
 DOCKER_DIR := docker
 SERVER_COMPOSE := $(DOCKER_DIR)/server/docker-compose.yml
 SERVER_PROJECT_DIR := $(DOCKER_DIR)/server
-SERVER_PROJECT_NAME := derhost-server
+# override: a command-line SERVER_PROJECT_NAME would reach recipes unquoted
+# and retarget the server project (#85).
+override SERVER_PROJECT_NAME := derhost-server
 DERHOST_STACK_PORT := 5410
 DERHOST_HEALTHY_WAIT_SECS := 60
 
@@ -72,6 +74,28 @@ pass-through = $(if $(filter-out undefined,$($(1)_ORIGIN)),$(1)=$(call shell-saf
 # stack-up builds through each agent's own build.sh (check-clean and git
 # archive included) first, then starts it with --no-build.
 AGENT_DIRS := interoperability-service realtime-control-agent
+
+# AGENT_DIRS may be set on the command line (`make stack-smoke AGENT_DIRS=...`)
+# and reaches recipes as `derhost-$$name` and `$(foreach ...)` text, so it is
+# validated here, at parse time, before the first line that expands it. The
+# check reads `$(value AGENT_DIRS)`, which returns the text without expanding
+# a `$(shell ...)` in it, and strips the allowed characters with nested
+# `$(subst)`, whose result Make never re-expands; anything left over is a
+# character that has no business in a directory name. `call` is avoided on
+# purpose: it re-expands an argument that contains `$`. An empty list passes;
+# stack-smoke has its own refusal for that. The same check refuses `server`
+# and `smoke` for every target, since they would collide with the server and
+# smoke projects. docker/smoke.sh keeps its own validation for runs without
+# make.
+_AD_PASS1 := $(subst i,,$(subst h,,$(subst g,,$(subst f,,$(subst e,,$(subst d,,$(subst c,,$(subst b,,$(subst a,,$(value AGENT_DIRS))))))))))
+_AD_PASS2 := $(subst r,,$(subst q,,$(subst p,,$(subst o,,$(subst n,,$(subst m,,$(subst l,,$(subst k,,$(subst j,,$(_AD_PASS1))))))))))
+_AD_PASS3 := $(subst z,,$(subst y,,$(subst x,,$(subst w,,$(subst v,,$(subst u,,$(subst t,,$(subst s,,$(_AD_PASS2)))))))))
+_AD_LEFT := $(subst -,,$(subst 9,,$(subst 8,,$(subst 7,,$(subst 6,,$(subst 5,,$(subst 4,,$(subst 3,,$(subst 2,,$(subst 1,,$(subst 0,,$(_AD_PASS3))))))))))))
+_AD_WORDS := $(value AGENT_DIRS)
+$(if $(strip $(_AD_LEFT)),$(error AGENT_DIRS is invalid: only a-z 0-9 - and spaces are allowed))
+$(if $(filter -%,$(_AD_WORDS)),$(error AGENT_DIRS is invalid: an entry starts with -))
+$(if $(filter server smoke,$(_AD_WORDS)),$(error AGENT_DIRS lists a reserved name: server and smoke collide with the server and smoke projects))
+$(if $(filter-out $(words $(sort $(_AD_WORDS))),$(words $(_AD_WORDS))),$(error AGENT_DIRS is invalid: an entry is repeated))
 
 override OTHER_COMPOSE_FILES := $(foreach d,$(AGENT_DIRS),$(DOCKER_DIR)/$(d)/docker-compose.yml)
 export OTHER_COMPOSE_FILES
