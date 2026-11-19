@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -139,30 +138,12 @@ def test_server_internal_bind_is_all_interfaces() -> None:
     assert '"--host", "0.0.0.0", "--port", "8000"' in dockerfile, dockerfile
 
 
-# --- Rule 2: no Docker socket mount, and no /var/run or /run mount. ---------
-
-
-def _normalize_host_path(raw: str) -> str:
-    path = posixpath.normpath(raw)
-    # normpath keeps a leading "//" as is; POSIX reads it as "/".
-    return "/" + path.lstrip("/") if path.startswith("/") else path
-
-
-def _host_paths(service: dict[str, Any]) -> Iterator[tuple[Any, str]]:
-    """(volume entry, normalized host path) for each short-form and long-form
-    volume that can name a host path. Named volumes pass through unchanged."""
-    for volume in service.get("volumes") or []:
-        if isinstance(volume, dict):
-            if volume.get("type") in ("volume", "tmpfs", "image") or not volume.get("source"):
-                continue
-            yield volume, _normalize_host_path(str(volume["source"]))
-        else:
-            yield volume, _normalize_host_path(str(volume).split(":", 1)[0])
+# --- Rule 2: no Docker socket, and every mount source is a named volume or tmpfs. ---
 
 
 def check_no_docker_socket(name: str, service: dict[str, Any]) -> None:
-    for volume, host_path in _host_paths(service):
-        if "docker.sock" in host_path or "docker.sock" in str(volume):
+    for volume in service.get("volumes") or []:
+        if "docker.sock" in str(volume):
             raise AssertionError(f"{name}: mounts the Docker socket: {volume!r}")
 
 
@@ -171,46 +152,58 @@ def test_no_docker_socket_mount() -> None:
         check_no_docker_socket(name, service)
 
 
+# A compose volume name. Anything else in the source slot (a path, `.`, `~`,
+# `$`) is a host path or an interpolation that could become one.
+_VOLUME_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*")
+
+
+def _is_volume_name(source: Any) -> bool:
+    return _VOLUME_NAME.fullmatch(str(source)) is not None
+
+
+def check_named_volumes_only(name: str, service: dict[str, Any]) -> None:
+    if service.get("volumes_from"):
+        raise AssertionError(f"{name}: volumes_from inherits another service's mounts: {service['volumes_from']!r}")
+    for volume in service.get("volumes") or []:
+        if isinstance(volume, dict):
+            allowed = volume.get("type") == "tmpfs" or (
+                volume.get("type") == "volume" and _is_volume_name(volume.get("source") or "")
+            )
+        else:
+            allowed = _is_volume_name(str(volume).split(":", 1)[0])
+        if not allowed:
+            raise AssertionError(f"{name}: mount source is not a named volume or tmpfs: {volume!r}")
+
+
+def check_top_level_sources(path: Path, compose: dict[str, Any]) -> None:
+    for section in ("secrets", "configs"):
+        for key, entry in (compose.get(section) or {}).items():
+            source = entry.get("file") if isinstance(entry, dict) else None
+            if source is None:
+                continue
+            normalized = posixpath.normpath(str(source))
+            if (
+                "$" in str(source)
+                or str(source).startswith("~")
+                or posixpath.isabs(normalized)
+                or (normalized == ".." or normalized.startswith("../"))
+            ):
+                raise AssertionError(
+                    f"{path}: {section} {key}: file {source!r} must be a plain relative path inside the project"
+                )
+    for key, entry in (compose.get("volumes") or {}).items():
+        if isinstance(entry, dict) and entry.get("driver_opts"):
+            raise AssertionError(f"{path}: volume {key} sets driver_opts, which can bind a host path: {entry!r}")
+
+
+def test_mount_sources_are_named_volumes_or_tmpfs() -> None:
+    for _, name, service in _all_services():
+        check_named_volumes_only(name, service)
+
+
 def test_no_docker_socket_mount_fixture_fails() -> None:
     with pytest.raises(AssertionError, match="Docker socket"):
         check_no_docker_socket(SERVER_SERVICE, {"volumes": ["/var/run/docker.sock:/var/run/docker.sock:ro"]})
-
-
-def check_no_var_run_mount(name: str, service: dict[str, Any]) -> None:
-    for volume, host_path in _host_paths(service):
-        # "/" and "/var" contain the runtime directories, so mounting them reaches the socket.
-        if host_path in ("/", "/var", "/var/run", "/run") or host_path.startswith(("/var/run/", "/run/")):
-            raise AssertionError(f"{name}: mounts a host runtime directory or a parent of one: {volume!r}")
-
-
-def test_no_var_run_mount() -> None:
-    for _, name, service in _all_services():
-        check_no_var_run_mount(name, service)
-
-
-def test_no_var_run_mount_fixture_fails() -> None:
-    # /var/run is the Docker socket's parent directory: mounting it reaches
-    # the socket without naming it.
-    with pytest.raises(AssertionError, match="host runtime directory"):
-        check_no_var_run_mount(SERVER_SERVICE, {"volumes": ["/var/run:/var/run"]})
-
-
-@pytest.mark.parametrize(
-    "volume",
-    [
-        {"type": "bind", "source": "/var/run", "target": "/x"},
-        {"type": "bind", "source": "/run", "target": "/x"},
-        {"type": "bind", "source": "/", "target": "/x"},
-        "/:/host",
-        "/var:/v:ro",
-        "/var/run/../run:/r",
-        "//var/run:/r",
-        "/var/./run/sub:/r",
-    ],
-)
-def test_runtime_and_root_mounts_fail_in_both_volume_forms(volume: Any) -> None:
-    with pytest.raises(AssertionError, match="host runtime directory"):
-        check_no_var_run_mount(SERVER_SERVICE, {"volumes": [volume]})
 
 
 @pytest.mark.parametrize(
@@ -223,8 +216,56 @@ def test_runtime_and_root_mounts_fail_in_both_volume_forms(volume: Any) -> None:
     ],
 )
 def test_docker_socket_mounts_fail_in_both_volume_forms(volume: Any) -> None:
-    with pytest.raises(AssertionError, match="Docker socket"):
+    with pytest.raises(AssertionError, match="Docker socket") as excinfo:
         check_no_docker_socket(SERVER_SERVICE, {"volumes": [volume]})
+    assert repr(volume) in str(excinfo.value)
+
+
+# Every mount source must be a compose volume name or a tmpfs. A path, a
+# relative path, `~` or an interpolation is refused without the rule having to
+# know what it resolves to, so a host path cannot slip past a deny-list.
+_REFUSED_MOUNTS = [
+    "/var/run:/var/run",
+    {"type": "bind", "source": "/var/run", "target": "/x"},
+    {"type": "bind", "source": "/run", "target": "/x"},
+    {"type": "bind", "source": "/", "target": "/x"},
+    "/:/host",
+    "/var:/v:ro",
+    "/var/run/../run:/r",
+    "//var/run:/r",
+    "/var/./run/sub:/r",
+    "/run/containerd/containerd.sock:/x",
+    "/proc/1/root:/h",
+    "/proc/1/root/run:/h",
+    "/etc:/e",
+    "/sys:/s",
+    "/dev:/d",
+    "/root:/h",
+    "~root:/x",
+    "./data:/data:ro",
+    "/var/lib/derhost:/data",
+    "../../../../../../../../../../var/run:/a",
+    "${D:-/var/run}:/a",
+    "$D:/a",
+    {"type": "bind", "source": "/etc", "target": "/e"},
+    {"type": "volume", "source": "/etc", "target": "/e"},
+    {"type": "volume", "target": "/e"},
+    {"type": "bind", "source": "derhost-home", "target": "/e"},
+    {"type": "image", "source": "derhost-server:local", "target": "/e"},
+]
+
+
+@pytest.mark.parametrize("volume", _REFUSED_MOUNTS)
+def test_a_mount_source_that_is_not_a_named_volume_or_tmpfs_fails(volume: Any) -> None:
+    with pytest.raises(AssertionError, match="not a named volume") as excinfo:
+        check_named_volumes_only(SERVER_SERVICE, {"volumes": [volume]})
+    assert repr(volume) in str(excinfo.value)
+
+
+def test_volumes_from_is_refused_because_it_inherits_another_services_mounts() -> None:
+    with pytest.raises(AssertionError, match="volumes_from") as excinfo:
+        check_named_volumes_only(SERVER_SERVICE, {"volumes_from": ["other"]})
+    assert "other" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
@@ -232,17 +273,64 @@ def test_docker_socket_mounts_fail_in_both_volume_forms(volume: Any) -> None:
     [
         "derhost-home:/var/volttron",
         {"type": "volume", "source": "derhost-home", "target": "/var/volttron"},
-        "./data:/data:ro",
         {"type": "tmpfs", "target": "/tmp"},
-        "/var/lib/derhost:/data",
     ],
 )
 def test_ordinary_mounts_pass_the_mount_rules(volume: Any) -> None:
-    # Control: the normalizer must not turn a named volume or an unrelated
-    # host path into a refusal.
-    service = {"volumes": [volume]}
-    check_no_var_run_mount(SERVER_SERVICE, service)
+    # Control: the refusals above come from the source, not from a blanket
+    # refusal of volumes.
+    service = {"volumes": [volume], "volumes_from": []}
+    check_named_volumes_only(SERVER_SERVICE, service)
     check_no_docker_socket(SERVER_SERVICE, service)
+
+
+# --- Rule 2b: top-level secrets, configs and volumes name no host path. -----
+
+
+@pytest.mark.parametrize(
+    ("compose", "key", "needle"),
+    [
+        ({"secrets": {"s": {"file": "/var/run/docker.sock"}}}, "s", "/var/run/docker.sock"),
+        ({"configs": {"c": {"file": "/etc/passwd"}}}, "c", "/etc/passwd"),
+        ({"secrets": {"s": {"file": "../../x"}}}, "s", "../../x"),
+        ({"secrets": {"s": {"file": "./a/../../x"}}}, "s", "./a/../../x"),
+        ({"secrets": {"s": {"file": ".."}}}, "s", ".."),
+        ({"secrets": {"s": {"file": "${P}"}}}, "s", "${P}"),
+        ({"secrets": {"s": {"file": "./${P}/x"}}}, "s", "./${P}/x"),
+        ({"configs": {"c": {"file": "~root/c"}}}, "c", "~root/c"),
+        ({"volumes": {"v": {"driver_opts": {"type": "none", "o": "bind", "device": "/var/run"}}}}, "v", "driver_opts"),
+    ],
+)
+def test_top_level_sources_that_reach_the_host_fail(compose: dict[str, Any], key: str, needle: str) -> None:
+    path = DOCKER_DIR / "some-agent" / "docker-compose.yml"
+    with pytest.raises(AssertionError) as excinfo:
+        check_top_level_sources(path, compose)
+    message = str(excinfo.value)
+    assert key in message and needle in message and str(path) in message
+
+
+@pytest.mark.parametrize(
+    "compose",
+    [
+        {"secrets": {"jwt": {"file": "./secrets/jwt"}}},
+        {"secrets": {"jwt": {"file": "secrets/../secrets/jwt"}}},
+        {"secrets": {"jwt": {"environment": "JWT"}}},
+        {"configs": {"c": {"content": "x"}}},
+        {"volumes": {"derhost-home": {"driver": "local"}}},
+        {"volumes": {"derhost-home": None}},
+        {},
+    ],
+)
+def test_top_level_sources_inside_the_project_pass(compose: dict[str, Any]) -> None:
+    # Control: the refusals above come from the file or driver_opts value.
+    check_top_level_sources(DOCKER_DIR / "some-agent" / "docker-compose.yml", compose)
+
+
+def test_top_level_sources_of_every_real_compose_file_pass() -> None:
+    paths = [*discover_compose_files(), *discover_overlay_files()]
+    assert len(paths) == 6, paths
+    for path in paths:
+        check_top_level_sources(path, load_compose(path))
 
 
 # --- Rule 3: non-root user 1000, every service. ------------------------------
@@ -375,6 +463,7 @@ def test_no_host_namespace_fixture_fails_pid() -> None:
         ({"security_opt": ["apparmor:unconfined"]}, "apparmor:unconfined"),
         ({"security_opt": ["label=disable"]}, "label=disable"),
         ({"security_opt": ["label:disable"]}, "label:disable"),
+        ({"security_opt": [" Seccomp=Unconfined "]}, "Seccomp=Unconfined"),
         ({"security_opt": ["no-new-privileges:true", "systempaths=unconfined"]}, "systempaths=unconfined"),
         ({"ipc": "host"}, "ipc"),
         ({"userns_mode": "host"}, "userns_mode"),
@@ -590,10 +679,9 @@ _BOOLEAN_SUFFIXES = ("ENABLED", "REQUIRED")
 def _declared_secret_names(service: dict[str, Any]) -> set[str]:
     names: set[str] = set()
     for entry in service.get("secrets") or []:
-        if isinstance(entry, dict):
-            names.add(str(entry.get("target") or entry.get("source")))
-        else:
-            names.add(str(entry))
+        declared = (entry.get("target") or entry.get("source")) if isinstance(entry, dict) else entry
+        if declared:
+            names.add(str(declared))
     return names
 
 
@@ -609,7 +697,8 @@ def _is_declared_secret_file(key: str, value: str, service: dict[str, Any]) -> b
 def _is_config_shaped(key: str, value: str) -> bool:
     suffix = key.upper().rsplit("_", 1)[-1]
     if suffix in _NUMERIC_SUFFIXES:
-        return re.fullmatch(r"[0-9]+", value) is not None
+        # Six digits cover a real TTL or count; a longer run is a secret in disguise.
+        return re.fullmatch(r"[0-9]{1,6}", value) is not None
     if suffix in _BOOLEAN_SUFFIXES:
         return value.lower() in ("true", "false", "0", "1")
     return False
@@ -658,6 +747,13 @@ def test_no_secret_env_fixture_fails_password() -> None:
         ({"ACCESS_TOKEN_EXPIRE_MINUTES": 30}, []),
         ({"TOKEN_CACHE_ENABLED": "true"}, []),
         ({"TOKEN_CACHE_ENABLED": True}, []),
+        ({"TOKEN_CACHE_REQUIRED": "false"}, []),
+        ({"SESSION_TOKEN_SECONDS": "60"}, []),
+        ({"SESSION_TOKEN_HOURS": "8"}, []),
+        ({"SESSION_TOKEN_DAYS": "7"}, []),
+        ({"ACCESS_TOKEN_TTL": "123456"}, []),
+        ({"RETRY_TOKEN_COUNT": "3"}, []),
+        ({"ADMIN_PASSWORD_LENGTH": "32"}, []),
         ({"VOLTTRON_HOME": "/var/volttron"}, []),
     ],
 )
@@ -676,6 +772,13 @@ def test_secret_env_allowances_pass(environment: Any, secrets: list[Any]) -> Non
         ({"JWT_SECRET_KEY_FILE": "${JWT_PATH}"}, ["jwt"], "JWT_SECRET_KEY_FILE"),
         ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, [], "JWT_SECRET_KEY_FILE"),
         ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, ["other"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/.."}, [".."], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/$X"}, ["$X"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/None"}, [{}], "JWT_SECRET_KEY_FILE"),
+        ({"ACCESS_TOKEN_TTL": ""}, [], "ACCESS_TOKEN_TTL"),
+        ({"ACCESS_TOKEN_TTL": "1234567"}, [], "ACCESS_TOKEN_TTL"),
+        ({"ACCESS_TOKEN_TTL": "9" * 40}, [], "ACCESS_TOKEN_TTL"),
+        ({"ADMIN_PASSWORD_LENGTH": "73914562"}, [], "ADMIN_PASSWORD_LENGTH"),
         ({"ACCESS_TOKEN_EXPIRE_MINUTES": "abcdef"}, [], "ACCESS_TOKEN_EXPIRE_MINUTES"),
         ({"ACCESS_TOKEN_EXPIRE_MINUTES": "${MINUTES}"}, [], "ACCESS_TOKEN_EXPIRE_MINUTES"),
         ({"TOKEN_CACHE_ENABLED": "maybe"}, [], "TOKEN_CACHE_ENABLED"),
@@ -728,7 +831,7 @@ def test_a_compose_file_under_another_name_or_place_is_refused(tmp_path: Path, r
     _touch(tmp_path, "x/docker-compose.yml", "x/compose.smoke.yml", relative)
     with pytest.raises(AssertionError, match="not accepted") as excinfo:
         check_compose_file_names(tmp_path)
-    assert Path(relative).name in str(excinfo.value)
+    assert str(tmp_path / relative) in str(excinfo.value)
 
 
 def test_a_tree_of_accepted_names_passes_discovery(tmp_path: Path) -> None:
@@ -778,7 +881,7 @@ SMOKE_NETWORK = "derhost-smoke-net"
 SERVER_OVERLAY_PORTS = ["${DERHOST_PUBLISH_HOST:-127.0.0.1}::8000"]
 _FORBIDDING_RULES = (
     check_no_docker_socket,
-    check_no_var_run_mount,
+    check_named_volumes_only,
     check_no_cap_add,
     check_not_privileged,
     check_no_host_namespace,
