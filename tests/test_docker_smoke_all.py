@@ -80,7 +80,14 @@ listing() {
 if [ "${1-}" = "compose" ]; then
     shift
     case " $* " in
-        *" config "*) exec "$STUB_REAL_DOCKER" compose "$@" ;;
+        *" config "*)
+            # Signals smoke.sh during its first config step, then outlasts any
+            # test bound, so only a prompt reaction ends the run in time.
+            if [ -n "${STUB_SIGNAL_CONFIG-}" ]; then
+                kill "-$STUB_SIGNAL_CONFIG" "$(cat "$STUB_SMOKE_PIDFILE")"
+                exec sleep 25
+            fi
+            exec "$STUB_REAL_DOCKER" compose "$@" ;;
         *" port "*) printf '%s\\n' "$STUB_PORT_OUTPUT" ;;
         *" up "*) exit "${STUB_UP_EXIT:-0}" ;;
         *" down "*)
@@ -135,6 +142,11 @@ fi
 # trap runs once the foreground build ends, so the run must not resume.
 if [ "${STUB_SIGNAL_DIR-}" = "$dir" ]; then
     kill "-$STUB_SIGNAL" "$(cat "$STUB_SMOKE_PIDFILE")"
+    # A build that keeps running after it signals, to show the run does not
+    # wait for it.
+    if [ -n "${STUB_BUILD_SLEEP-}" ]; then
+        exec sleep 25
+    fi
 fi
 """
 
@@ -575,6 +587,47 @@ def test_a_signal_during_the_server_build_is_acted_on_at_once_and_nothing_later_
     calls = _log_calls(stub_env)
     assert not [c for c in calls if c[0] == "build.sh"], calls
     assert not _compose_calls(calls, "up"), calls
+    assert _down_projects(calls) == ALL_SMOKE_PROJECTS, calls
+    assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize(("signal_name", "status"), [("INT", 130), ("TERM", 143)])
+def test_a_signal_during_the_first_config_step_ends_the_run_before_anything_is_built_or_torn_down(
+    smoke_tree: Path, stub_env: dict[str, str], signal_name: str, status: int
+) -> None:
+    # The stub's config outlasts the 15 s bound by 10 s. Nothing exists yet, so
+    # no teardown runs: the exit trap is not armed this early.
+    stub_env["STUB_SIGNAL_CONFIG"] = signal_name
+    started = time.monotonic()
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    elapsed = time.monotonic() - started
+    assert result.returncode == status, result.stdout + result.stderr
+    assert elapsed < 15, elapsed
+    assert f"caught {signal_name}, stopping" in result.stdout, result.stdout
+    calls = _log_calls(stub_env)
+    assert [c for c in calls if c[0] == "compose"], "the config step never ran"
+    assert not [c for c in calls if c[0] == "build.sh"], calls
+    assert not _compose_calls(calls, "build"), calls
+    assert not _compose_calls(calls, "up"), calls
+    assert not _compose_calls(calls, "down"), calls
+    assert "teardown" not in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize(("signal_name", "status"), [("INT", 130), ("TERM", 143)])
+def test_a_signal_during_an_agent_build_is_acted_on_at_once_and_tears_down(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer, signal_name: str, status: int
+) -> None:
+    # The stub's build outlasts the 15 s bound by 10 s: an agent build run in
+    # the foreground, where a trap waits for it, fails the bound.
+    stub_env["STUB_BUILD_SLEEP"] = "1"
+    started = time.monotonic()
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS), signal_at=(AGENTS[0], signal_name))
+    elapsed = time.monotonic() - started
+    assert result.returncode == status, result.stdout + result.stderr
+    assert elapsed < 15, elapsed
+    calls = _log_calls(stub_env)
+    assert [c[1] for c in calls if c[0] == "build.sh"] == [AGENTS[0]], calls
+    assert {_flag_value(c, "-p") for c in _compose_calls(calls, "up")} == {"derhost-smoke"}, calls
     assert _down_projects(calls) == ALL_SMOKE_PROJECTS, calls
     assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
 

@@ -140,6 +140,7 @@ def _run_build_sh(
     allow_dirty: str | None = None,
     docker_on_path: bool = True,
     overlay: str | None = None,
+    build_sh: Path = BUILD_SH,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     log_dir = tmp_path / "stub-log"
@@ -167,7 +168,7 @@ def _run_build_sh(
         env["DERHOST_BUILD_OVERLAY"] = overlay
 
     result = subprocess.run(
-        [shutil.which("bash") or "bash", str(BUILD_SH)],
+        [shutil.which("bash") or "bash", str(build_sh)],
         capture_output=True,
         text=True,
         env=env,
@@ -380,4 +381,25 @@ def test_build_refuses_an_overlay_outside_the_docker_tree_even_when_it_has_the_r
     result, log_dir = _run_build_sh(tmp_path, cwd=tmp_path, der_agent_src=str(agent_checkout), overlay=str(lookalike))
     assert result.returncode == 1, result.stderr
     assert "is not this agent's compose.smoke.yml" in result.stderr
+    assert not (log_dir / "compose_args.txt").exists()
+
+
+def test_build_refuses_its_own_overlay_path_when_that_file_is_missing(agent_checkout: Path, tmp_path: Path) -> None:
+    # The path matches this agent's compose.smoke.yml, so only the file check
+    # refuses it. A copy of docker/ lets the overlay be absent without
+    # touching the real one.
+    tree = tmp_path / "tree"
+    shutil.copytree(REPO_ROOT / "docker", tree / "docker")
+    own_overlay = (tree / "docker" / "realtime-control-agent" / "compose.smoke.yml").resolve()
+    own_overlay.unlink()
+    result, log_dir = _run_build_sh(
+        tmp_path / "run",
+        cwd=tmp_path,
+        der_agent_src=str(agent_checkout),
+        overlay=str(own_overlay),
+        build_sh=tree / "docker" / "realtime-control-agent" / "build.sh",
+    )
+    assert result.returncode == 1, result.stderr
+    assert f"build: DERHOST_BUILD_OVERLAY {own_overlay} is not a file" in result.stderr
+    assert "is not this agent's compose.smoke.yml" not in result.stderr
     assert not (log_dir / "compose_args.txt").exists()
