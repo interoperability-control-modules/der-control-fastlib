@@ -59,6 +59,13 @@ Run from the repository root.
 `stack-up` refuses before touching Docker when `DERHOST_PUBLISH_HOST` is not
 a usable value, or when host port 5410 is already bound.
 
+`AGENT_DIRS` may be set on the command line (`make stack-smoke AGENT_DIRS=...`).
+Every target checks its text before anything runs, and stops at parse time,
+before any docker call, when it holds a character other than `a-z`, `0-9`,
+`-` or a space, an entry that starts with `-`, a repeated entry, or the
+reserved names `server` and `smoke`. `SERVER_PROJECT_NAME` cannot be set: a
+value on the command line is ignored and the project stays `derhost-server`.
+
 ## Only one stack on port 5410 at a time
 
 The root `docker-compose.yml` stack and `docker/server/docker-compose.yml`
@@ -102,6 +109,13 @@ overlay, so the `:smoke` image is built directly and `derhost-<dir>:local` is
 never written, retagged or removed. `derhost-base:local` is the exception: each
 agent image builds on it, so a run builds it when it is missing and leaves it
 (and any `:local` image) in place; only the `:smoke` tags are removed.
+
+Only one smoke run goes at a time on a host: `smoke.sh` takes an exclusive
+`flock` on `${XDG_RUNTIME_DIR:-/tmp}/derhost-smoke.lock` right after it checks
+its inputs and before its first docker call, and a second run stops with
+"another smoke run holds <path>". Set `DERHOST_SMOKE_LOCK` to use another
+path. The lock is released when the run ends by any route, a kill included. A
+host without `flock` refuses to run rather than running unlocked.
 
 `INT` and `TERM` run the teardown and end the run with status 130 and 143. They
 are caught from before the first compose call. The config, build and up steps,

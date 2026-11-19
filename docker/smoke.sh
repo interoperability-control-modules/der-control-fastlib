@@ -391,6 +391,20 @@ step_restart() {
     log "StartedAt changed: $before -> $after"
 }
 
+# One smoke run per host at a time: the project, network and `:smoke` image
+# names are per daemon, so two runs would each tear down the other's objects
+# and read that as their own defect (#85). The lock lives on the open file
+# description, so the kernel drops it on every exit path, SIGKILL included;
+# no trap has to release it. A run that cannot lock refuses before it makes
+# its first docker call, and a missing flock refuses rather than running
+# unlocked.
+acquire_run_lock() {
+    local lock="${DERHOST_SMOKE_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/derhost-smoke.lock}"
+    command -v flock >/dev/null 2>&1 || die "flock is required to serialize smoke runs and is not on PATH"
+    exec 9>>"$lock" || die "cannot open the smoke lock $lock"
+    flock -n 9 || die "another smoke run holds $lock"
+}
+
 main() {
     # Caught from before the first compose call: a signal at any later step,
     # the builds included, ends the run with its status.
@@ -398,6 +412,7 @@ main() {
     trap 'on_signal TERM 143' TERM
 
     validate_agent_dirs
+    acquire_run_lock
 
     log "config -q"
     run timeout -k "$KILL_GRACE" "$STEP_TIMEOUT" "${COMPOSE_ARGS[@]}" config -q
