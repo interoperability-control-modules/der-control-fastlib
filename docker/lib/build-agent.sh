@@ -20,6 +20,25 @@ build_agent_image() {
     exit 1
   }
 
+  # Only this agent's own smoke overlay is accepted (docker/smoke.sh passes
+  # it): it renames the service's image, so the build tags that image directly
+  # and never writes the developer's :local tag. Any other file could rewrite
+  # the build context or the hardening, and an exported value must not reach a
+  # build that does not expect it.
+  local -a compose_files=(-f "${SCRIPT_DIR}/docker-compose.yml")
+  if [ -n "${DERHOST_BUILD_OVERLAY:-}" ]; then
+    local own_overlay="${SCRIPT_DIR}/compose.smoke.yml"
+    if [ "${DERHOST_BUILD_OVERLAY}" != "${own_overlay}" ]; then
+      echo "build: DERHOST_BUILD_OVERLAY ${DERHOST_BUILD_OVERLAY} is not this agent's compose.smoke.yml (${own_overlay})" >&2
+      exit 1
+    fi
+    if [ ! -f "${own_overlay}" ]; then
+      echo "build: DERHOST_BUILD_OVERLAY ${own_overlay} is not a file" >&2
+      exit 1
+    fi
+    compose_files+=(-f "${own_overlay}")
+  fi
+
   # check-clean.sh validates agent_src itself, not-a-checkout included;
   # compose never sees agent_src directly, only the absolute archive_dir
   # exported below, so this path does not need canonicalizing (#68).
@@ -46,5 +65,5 @@ build_agent_image() {
     docker build --target base -t derhost-base:local -f "${REPO_ROOT}/docker/server/Dockerfile" "${REPO_ROOT}"
   fi
 
-  docker compose -f "${SCRIPT_DIR}/docker-compose.yml" build
+  docker compose "${compose_files[@]}" build
 }

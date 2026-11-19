@@ -567,6 +567,10 @@ def test_smoke_overlay_config_shares_no_names_with_the_base_stack() -> None:
 def _run_smoke(extra_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.setdefault("DERHOST_SMOKE_STEP_TIMEOUT", "20")
+    # Server-only: the agent list smoke.sh now requires is empty here, so
+    # these cases keep covering the server project (the agents are
+    # tests/test_docker_smoke_all.py's).
+    env["DERHOST_SMOKE_AGENT_DIRS"] = ""
     env.update(extra_env)
     return subprocess.run(
         [str(REPO_ROOT / "docker" / "smoke.sh")],

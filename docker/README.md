@@ -35,13 +35,17 @@ Run from the repository root.
   realtime-control-agent. Each agent is built by its own `build.sh` (dirty
   checkout refused) and started with `--no-build`; the first failure stops
   the run. `C=all` refuses to start while `DER_AGENT_SRC` is set, since it
-  would apply to every agent; each uses its sibling checkout by default.
+  would apply to every agent; each uses its sibling checkout by default. It
+  also refuses while `DERHOST_BUILD_OVERLAY` is set: only `stack-smoke` sets
+  it, and a `build.sh` accepts no file but its own `compose.smoke.yml`.
 - `make stack-down` - stop everything under `docker/` (each agent first, then
   the server, since agents join the server's network and it must be free of
   attached containers before the server's own `down` can remove it). A failed
   agent `down` does not stop the rest; the command exits non-zero at the end
   naming each agent whose `down` failed.
 - `make stack-status` - `docker compose ps` for each stack.
+- `make stack-smoke` - smoke-test the server and every `AGENT_DIRS` agent in
+  their own `derhost-smoke` projects (see "Smoke test").
 - `make stack-check` - `GET /connections` from the host and confirm the
   identities in `EXPECTED` (comma-separated) are connected; `EXPECTED=`
   (the default) trivially passes.
@@ -74,17 +78,48 @@ environment; an environment value always wins over the `.env` file.
 
 ## Smoke test
 
-`docker/smoke.sh` runs `config -q`, `build`, `up --wait`, `stack-check` and
-`down` against `docker/server`, each step bounded with `timeout`, and always
-brings the stack down on exit. It runs in its own compose project
-(`derhost-smoke`, `docker/server/compose.smoke.yml`), disjoint by name from
-the `stack-up` project, so it may run while a developer's stack is up; it
-refuses only when a leftover `derhost-smoke` object already exists (a killed
-or concurrent run). Its published port is ephemeral, so port 5410 does not
-matter to it; `DERHOST_PUBLISH_HOST` still selects the loopback address. CI
-does not build or run containers here, so the author runs this locally and
-pastes its output into the PR:
+`make stack-smoke` runs `docker/smoke.sh` over the server and every directory
+in `AGENT_DIRS`. It proves the server is healthy, each agent registers its
+identity (`platform.presentation`, `der.rtc`), the `der.rtc` agent leaves and
+rejoins within 10 s of a stop and start with a new `StartedAt`, and nothing
+labelled or named `derhost-smoke` is left afterwards (the count is printed).
+Job probes are not part of it yet.
+
+Each agent directory has a `compose.smoke.yml` overlay: project, container
+and image tag (`:smoke`) differ from its base file, and the agent joins the
+server's `derhost-smoke-net`. The run is disjoint by name from `stack-up`, so
+it may run while a developer's stack is up. It refuses before building when a
+`derhost-smoke*` object already exists (a killed or concurrent run), and
+`server` or `smoke` in `AGENT_DIRS` is refused before any docker call, and so
+is an empty `AGENT_DIRS`. Agents are built by their own `build.sh` with the
+overlay, so the `:smoke` image is built directly and `derhost-<dir>:local` is
+never written, retagged or removed. `derhost-base:local` is the exception: each
+agent image builds on it, so a run builds it when it is missing and leaves it
+(and any `:local` image) in place; only the `:smoke` tags are removed.
+
+`INT` and `TERM` run the teardown and end the run with status 130 and 143. They
+are caught from before the first compose call. The config, build and up steps,
+the agent builds included, are interrupted at once; the check, port and
+teardown steps finish first, each within its own timeout. A second signal
+during teardown is noted and ignored: the teardown finishes first. A teardown
+step that fails is named, the remaining objects are still counted, and the run
+exits non-zero (with the original status when it had one).
+
+Timeouts, all in seconds and all set through the environment:
+
+- `DERHOST_SMOKE_STEP_TIMEOUT` (120): each compose step and each check.
+- `DERHOST_SMOKE_BUILD_TIMEOUT` (600): each agent's `build.sh`. The server
+  build uses the step timeout.
+- `DERHOST_SMOKE_WAIT_TIMEOUT` (60): the health wait on `up` and the wait for
+  every identity to connect.
+- `DERHOST_SMOKE_RESTART_WINDOW` (10): how long the restarted agent has to
+  show as absent after the stop, and again to reconnect after the start.
+- `DERHOST_SMOKE_POLL_SECS` (1): the pause between checks while waiting.
+
+CI does not build or run containers here, so
+the author runs it locally and pastes its output into the PR. If
+`127.0.0.1` does not answer on the host, publish on another loopback address:
 
 ```
-DERHOST_PUBLISH_HOST=127.0.0.2 docker/smoke.sh
+DERHOST_PUBLISH_HOST=127.0.0.2 make stack-smoke
 ```
