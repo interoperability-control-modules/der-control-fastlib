@@ -237,7 +237,7 @@ def test_dockerfile_cmd_enables_debug_logging() -> None:
 
 
 def _build_args(agent: str, revision: str | None) -> dict[str, str]:
-    env = dict(os.environ, DER_AGENT_SRC="unused")
+    env = dict(os.environ, DER_AGENT_SRC="/dev/null/no-build")
     env.pop("AGENT_REVISION", None)
     if revision is not None:
         env["AGENT_REVISION"] = revision
