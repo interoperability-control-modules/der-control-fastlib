@@ -61,6 +61,30 @@ def check_compose_file_names(root: Path) -> list[Path]:
     return accepted
 
 
+# Docker reads the repo root's docker-compose.yml by default. The root file is
+# the generated legacy stack, which mounts the Docker socket on purpose, so it
+# is accepted by name only while it carries its generator's header, and no
+# other rule runs over it. Retiring or hardening it is tracked in #145.
+_GENERATED_ROOT_HEADER = "# Generated docker-compose.yml"
+
+
+def check_root_compose_names(root: Path) -> list[Path]:
+    """Return the root's accepted compose file; refuse any other compose-shaped name at its top level."""
+    accepted: list[Path] = []
+    for path in sorted(root.iterdir()):
+        if not path.is_file() or not _is_compose_shaped(path.name):
+            continue
+        if path.name != "docker-compose.yml":
+            raise AssertionError(f"{path}: compose file name not accepted at the repo root; only docker-compose.yml is")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not lines or lines[0] != _GENERATED_ROOT_HEADER:
+            raise AssertionError(
+                f"{path}: the root docker-compose.yml must open with the generated header {_GENERATED_ROOT_HEADER!r}"
+            )
+        accepted.append(path)
+    return accepted
+
+
 class _ComposeLoader(yaml.SafeLoader):
     """SafeLoader that reads compose's `!override` and `!reset` merge tags as
     the plain value they wrap, since an overlay file may carry them."""
@@ -161,6 +185,11 @@ def _is_volume_name(source: Any) -> bool:
     return _VOLUME_NAME.fullmatch(str(source)) is not None
 
 
+# `c:/etc:/x` splits at its first colon into the name `c`, but Compose reads
+# a drive letter followed by a slash as a host path.
+_DRIVE_PATH = re.compile(r"[a-zA-Z]:[/\\]")
+
+
 def check_named_volumes_only(name: str, service: dict[str, Any]) -> None:
     if service.get("volumes_from"):
         raise AssertionError(f"{name}: volumes_from inherits another service's mounts: {service['volumes_from']!r}")
@@ -170,7 +199,7 @@ def check_named_volumes_only(name: str, service: dict[str, Any]) -> None:
                 volume.get("type") == "volume" and _is_volume_name(volume.get("source") or "")
             )
         else:
-            allowed = _is_volume_name(str(volume).split(":", 1)[0])
+            allowed = _DRIVE_PATH.match(str(volume)) is None and _is_volume_name(str(volume).split(":", 1)[0])
         if not allowed:
             raise AssertionError(f"{name}: mount source is not a named volume or tmpfs: {volume!r}")
 
@@ -194,6 +223,17 @@ def check_top_level_sources(path: Path, compose: dict[str, Any]) -> None:
     for key, entry in (compose.get("volumes") or {}).items():
         if isinstance(entry, dict) and entry.get("driver_opts"):
             raise AssertionError(f"{path}: volume {key} sets driver_opts, which can bind a host path: {entry!r}")
+
+
+def check_no_compose_references(path: Path, compose: dict[str, Any]) -> None:
+    """Refuse `include` and `extends`: they pull in files this reading never sees."""
+    if "include" in compose:
+        raise AssertionError(f"{path}: include pulls in files the layout rules do not read: {compose['include']!r}")
+    for name, service in (compose.get("services") or {}).items():
+        if isinstance(service, dict) and "extends" in service:
+            raise AssertionError(
+                f"{path}: {name}: extends pulls in a service the layout rules do not read: {service['extends']!r}"
+            )
 
 
 def test_mount_sources_are_named_volumes_or_tmpfs() -> None:
@@ -247,6 +287,10 @@ _REFUSED_MOUNTS = [
     "../../../../../../../../../../var/run:/a",
     "${D:-/var/run}:/a",
     "$D:/a",
+    "derhost-home/x:/x",
+    "derhost$D:/x",
+    "c:/etc:/x",
+    "C:\\Windows:/x",
     {"type": "bind", "source": "/etc", "target": "/e"},
     {"type": "volume", "source": "/etc", "target": "/e"},
     {"type": "volume", "target": "/e"},
@@ -264,8 +308,8 @@ def test_a_mount_source_that_is_not_a_named_volume_or_tmpfs_fails(volume: Any) -
 
 def test_volumes_from_is_refused_because_it_inherits_another_services_mounts() -> None:
     with pytest.raises(AssertionError, match="volumes_from") as excinfo:
-        check_named_volumes_only(SERVER_SERVICE, {"volumes_from": ["other"]})
-    assert "other" in str(excinfo.value)
+        check_named_volumes_only(SERVER_SERVICE, {"volumes_from": ["sidecar"]})
+    assert "sidecar" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
@@ -838,6 +882,99 @@ def test_a_tree_of_accepted_names_passes_discovery(tmp_path: Path) -> None:
     # Control: the refusals above come from the names, not from the fixture tree.
     _touch(tmp_path, "x/docker-compose.yml", "x/compose.smoke.yml", "x/Dockerfile", "x/notes.yml")
     assert [p.name for p in check_compose_file_names(tmp_path)] == ["compose.smoke.yml", "docker-compose.yml"]
+
+
+# --- Rule 14: no file is pulled in through include or extends (#75). ---------
+
+
+@pytest.mark.parametrize(
+    ("compose", "key", "needle"),
+    [
+        ({"include": ["other.yml"], "services": {}}, "include", "other.yml"),
+        ({"include": [{"path": "../x.yml"}], "services": {}}, "include", "../x.yml"),
+        ({"services": {"x": {"extends": {"file": "base.yml", "service": "x"}}}}, "extends", "base.yml"),
+        ({"services": {"x": {"extends": {"service": "y"}}}}, "extends", "'y'"),
+    ],
+)
+def test_a_compose_file_that_includes_or_extends_is_refused(compose: dict[str, Any], key: str, needle: str) -> None:
+    path = DOCKER_DIR / "some-agent" / "docker-compose.yml"
+    with pytest.raises(AssertionError) as excinfo:
+        check_no_compose_references(path, compose)
+    message = str(excinfo.value)
+    assert key in message and needle in message and str(path) in message
+
+
+def test_a_compose_file_without_references_passes() -> None:
+    # Control: the refusals above come from the keys, not from the file shape.
+    check_no_compose_references(
+        DOCKER_DIR / "some-agent" / "docker-compose.yml",
+        {"services": {"x": {"image": "i", "depends_on": ["y"]}}},
+    )
+
+
+def test_no_real_compose_file_includes_or_extends() -> None:
+    paths = [*discover_compose_files(), *discover_overlay_files()]
+    assert len(paths) == 6, paths
+    for path in paths:
+        check_no_compose_references(path, load_compose(path))
+
+
+# --- Rule 15: the repo root's compose file is a named exception (#75, #145). -
+
+
+def _write_root_file(root: Path, name: str, first_line: str) -> None:
+    (root / name).write_text(f"{first_line}\nservices: {{}}\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.override.yml",
+        "compose.smoke.yml",
+        "Docker-Compose.YML",
+    ],
+)
+def test_a_root_compose_file_under_another_name_is_refused(tmp_path: Path, name: str) -> None:
+    _write_root_file(tmp_path, "docker-compose.yml", _GENERATED_ROOT_HEADER)
+    _write_root_file(tmp_path, name, _GENERATED_ROOT_HEADER)
+    with pytest.raises(AssertionError, match="not accepted") as excinfo:
+        check_root_compose_names(tmp_path)
+    assert str(tmp_path / name) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("first_line", ["services:", "", "# Hand written", "x\n# Generated docker-compose.yml"])
+def test_a_root_docker_compose_without_the_generated_header_is_refused(tmp_path: Path, first_line: str) -> None:
+    _write_root_file(tmp_path, "docker-compose.yml", first_line)
+    with pytest.raises(AssertionError, match="generated header") as excinfo:
+        check_root_compose_names(tmp_path)
+    assert str(tmp_path / "docker-compose.yml") in str(excinfo.value)
+
+
+def test_an_empty_root_docker_compose_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "docker-compose.yml").write_text("", encoding="utf-8")
+    with pytest.raises(AssertionError, match="generated header"):
+        check_root_compose_names(tmp_path)
+
+
+def test_a_root_with_the_generated_file_and_other_files_passes(tmp_path: Path) -> None:
+    # Control: the refusals above come from the name and the header. A nested
+    # file is the docker/ check's concern, not this one's.
+    _write_root_file(tmp_path, "docker-compose.yml", _GENERATED_ROOT_HEADER)
+    _touch(tmp_path, "notes.yml", "x/compose.yaml")
+    (tmp_path / "generate-docker-compose.py").write_text("x = 1\n", encoding="utf-8")
+    assert check_root_compose_names(tmp_path) == [tmp_path / "docker-compose.yml"]
+
+
+def test_the_real_repo_root_has_exactly_the_generated_compose_file() -> None:
+    assert check_root_compose_names(REPO_ROOT) == [REPO_ROOT / "docker-compose.yml"]
+
+
+def test_the_generated_root_compose_file_includes_and_extends_nothing() -> None:
+    path = REPO_ROOT / "docker-compose.yml"
+    check_no_compose_references(path, load_compose(path))
 
 
 # --- Regression: the review's agent mutant (M11) must be rejected. ----------
