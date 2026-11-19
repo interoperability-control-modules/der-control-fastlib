@@ -98,11 +98,12 @@ agent image builds on it, so a run builds it when it is missing and leaves it
 (and any `:local` image) in place; only the `:smoke` tags are removed.
 
 `INT` and `TERM` run the teardown and end the run with status 130 and 143. They
-are caught from before the first compose call and act at once, a build in
-progress included. A second signal during teardown is noted and ignored: the
-teardown finishes first. A teardown step that fails is named, the remaining
-objects are still counted, and the run exits non-zero (with the original status
-when it had one).
+are caught from before the first compose call. The config, build and up steps,
+the agent builds included, are interrupted at once; the check, port and
+teardown steps finish first, each within its own timeout. A second signal
+during teardown is noted and ignored: the teardown finishes first. A teardown
+step that fails is named, the remaining objects are still counted, and the run
+exits non-zero (with the original status when it had one).
 
 Timeouts, all in seconds and all set through the environment:
 
