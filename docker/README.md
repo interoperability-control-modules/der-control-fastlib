@@ -86,10 +86,10 @@ environment; an environment value always wins over the `.env` file.
 
 `make stack-smoke` runs `docker/smoke.sh` over the server and every directory
 in `AGENT_DIRS`. It proves the server is healthy, each agent registers its
-identity (`platform.presentation`, `der.rtc`), the `der.rtc` agent leaves and
-rejoins within 10 s of a stop and start with a new `StartedAt`, and nothing
-labelled or named `derhost-smoke` is left afterwards (the count is printed).
-Job probes are not part of it yet.
+identity (`platform.presentation`, `der.rtc`), each agent answers its job
+probe (below), the `der.rtc` agent leaves and rejoins within 10 s of a stop
+and start with a new `StartedAt`, and nothing labelled or named
+`derhost-smoke` is left afterwards (the count is printed).
 
 Each agent directory has a `compose.smoke.yml` overlay: project, container
 and image tag (`:smoke`) differ from its base file, and the agent joins the
@@ -111,9 +111,37 @@ during teardown is noted and ignored: the teardown finishes first. A teardown
 step that fails is named, the remaining objects are still counted, and the run
 exits non-zero (with the original status when it had one).
 
+### Job probes
+
+Each agent directory holds a `smoke-probe.json`; a listed directory without
+one fails the run. `docker/lib/smoke_probe.py` (standard library, run by host
+`python3`) reads it after every identity has connected and before the restart:
+
+```
+{"identity": "der.rtc", "kind": "rpc", "method": "list_modes", "args": [],
+ "expect": {"type": "list", "min_length": 1}}
+```
+
+`identity` must equal the `--identity` in the agent's Dockerfile. `kind: rpc`
+calls `POST /api/rpc/call` with `agent_id`, `method`, and `args` and
+`kwargs`, both optional (default `[]` and `{}`). Keys other than `identity`,
+`kind`, `method`, `args`, `kwargs` and `expect` are refused. A failed call
+still answers HTTP 200 with `success: false` and an `error`, so the probe
+passes only on `success: true` and a `result` that meets `expect` (`type`:
+list, dict, str, int, float or bool; `min_length`: list, dict or str only).
+`kind: topic` is refused with a named error: it needs a WebSocket client and
+neither agent publishes.
+
+The interpreter ignores proxy environment variables, refuses a redirect
+rather than following it, and bounds the whole call (not each read) by
+`--timeout`, which defaults to 35 s, above the server's own 30 s RPC timeout.
+A directory without `smoke-probe.json` is refused with the other directory
+checks, before anything is built.
+
 Timeouts, all in seconds and all set through the environment:
 
-- `DERHOST_SMOKE_STEP_TIMEOUT` (120): each compose step and each check.
+- `DERHOST_SMOKE_STEP_TIMEOUT` (120): each compose step, each check and each
+  job probe.
 - `DERHOST_SMOKE_BUILD_TIMEOUT` (600): each agent's `build.sh`. The server
   build uses the step timeout.
 - `DERHOST_SMOKE_WAIT_TIMEOUT` (60): the health wait on `up` and the wait for

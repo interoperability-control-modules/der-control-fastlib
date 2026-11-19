@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Smoke-tests the docker/server stack and every agent directory in
 # DERHOST_SMOKE_AGENT_DIRS end to end (#68, #95): config, build, up, health
-# wait, identity check, restart of one agent, down, teardown count. Every
-# project here is a derhost-smoke project with its own compose overlay, so a
+# wait, identity check, job probes, restart of one agent, down, teardown count.
+# Every project here is a derhost-smoke project with its own compose overlay, so a
 # run never names or removes a developer's `stack-up` objects. Run it as
 # `make stack-smoke`, which passes AGENT_DIRS in. The author runs this
 # locally and pastes its output into the PR body, since CI does not build or
@@ -127,7 +127,7 @@ validate_agent_dirs() {
         fi
         seen="$seen$dir "
         local file
-        for file in docker-compose.yml compose.smoke.yml build.sh Dockerfile; do
+        for file in docker-compose.yml compose.smoke.yml build.sh Dockerfile smoke-probe.json; do
             [ -f "$SCRIPT_DIR/$dir/$file" ] || die "docker/$dir/$file is missing"
         done
         AGENTS+=("$dir")
@@ -343,10 +343,26 @@ step_build_and_start_agent() {
     agent_compose_run "$dir" "$STEP_TIMEOUT" up -d --no-build --wait --wait-timeout "$WAIT_TIMEOUT"
 }
 
-# Issue 96's job probes run here, once both agents are connected and before
-# the restart. Nothing runs yet.
+# One job probe per listed agent, once every identity is connected and before
+# the restart. validate_agent_dirs has already refused a directory without a
+# probe file: an agent that is connected but never asked to do anything is not
+# smoke-tested. The probe's identity must be the one the Dockerfile registers,
+# so the file cannot drift.
 step_job_probes() {
-    log "job probes: none yet (issue 96)"
+    local dir probe identity rc
+    for dir in "${AGENTS[@]+"${AGENTS[@]}"}"; do
+        probe="$SCRIPT_DIR/$dir/smoke-probe.json"
+        identity="$(agent_identity "$dir")"
+        log "probe $dir"
+        # Through `run`, like every other step, so a signal ends it at once.
+        # The interpreter prints its own result line ("probe ok:" on stdout,
+        # "probe failed:" on stderr); the status here tells a probe that
+        # failed (1) from one `timeout` ended (124).
+        rc=0
+        run timeout -k "$KILL_GRACE" "$STEP_TIMEOUT" python3 "$SCRIPT_DIR/lib/smoke_probe.py" "$probe" "$BASE_URL" \
+            --identity "$identity" || rc=$?
+        [ "$rc" -eq 0 ] || die "job probe failed for $dir (exit status $rc)"
+    done
 }
 
 step_restart() {

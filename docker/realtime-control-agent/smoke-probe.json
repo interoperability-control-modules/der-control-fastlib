@@ -1,0 +1,7 @@
+{
+  "identity": "der.rtc",
+  "kind": "rpc",
+  "method": "list_modes",
+  "args": [],
+  "expect": {"type": "list", "min_length": 1}
+}
