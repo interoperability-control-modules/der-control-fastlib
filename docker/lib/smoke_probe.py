@@ -10,10 +10,13 @@ the probe passes and 1 with a one-line reason on stderr otherwise.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import http.client
 import json
+import socket
 import sys
-import urllib.error
-import urllib.request
+import threading
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,9 @@ _TYPES: dict[str, type | tuple[type, ...]] = {
     "bool": bool,
 }
 _SIZED = ("list", "dict", "str")
+_PROBE_KEYS = {"identity", "kind", "method", "args", "kwargs", "expect"}
+# How much of an error reply's body is quoted in the failure line.
+_EXCERPT_BYTES = 200
 
 
 class ProbeError(Exception):
@@ -60,6 +66,9 @@ def load_probe(path: Path, identity: str | None) -> dict[str, Any]:
 
 
 def _check_rpc_shape(probe: dict[str, Any], path: Path) -> None:
+    unknown_keys = set(probe) - _PROBE_KEYS
+    if unknown_keys:
+        raise ProbeError(f"probe file {path}: unknown probe keys {sorted(unknown_keys)}")
     if not isinstance(probe.get("method"), str) or not probe["method"]:
         raise ProbeError(f"probe file {path} is missing a string 'method'")
     if not isinstance(probe.get("args", []), list):
@@ -82,7 +91,29 @@ def _check_rpc_shape(probe: dict[str, Any], path: Path) -> None:
             raise ProbeError(f"probe file {path}: expect.min_length needs type list, dict or str")
 
 
+def _split_base_url(base_url: str) -> tuple[str, int | None, str]:
+    try:
+        parts = urllib.parse.urlsplit(base_url)
+        port = parts.port
+    except ValueError as exc:
+        raise ProbeError(f"base URL {base_url!r} is not http://HOST[:PORT]: {exc}") from exc
+    if parts.scheme != "http" or not parts.hostname:
+        raise ProbeError(f"base URL {base_url!r} is not http://HOST[:PORT]")
+    return parts.hostname, port, parts.path.rstrip("/") + "/api/rpc/call"
+
+
+def _excerpt(response: http.client.HTTPResponse) -> str:
+    """The start of an error reply's body on one line, or "" when it has none."""
+    try:
+        raw = response.read(_EXCERPT_BYTES)
+    except (OSError, http.client.HTTPException):
+        # Only extra context for a failure that is already being reported.
+        return ""
+    return " ".join(raw.decode("utf-8", errors="replace").split())
+
+
 def call_rpc(base_url: str, probe: dict[str, Any], timeout: float) -> dict[str, Any]:
+    host, port, path = _split_base_url(base_url)
     body = json.dumps(
         {
             "agent_id": probe["identity"],
@@ -91,24 +122,53 @@ def call_rpc(base_url: str, probe: dict[str, Any], timeout: float) -> dict[str, 
             "kwargs": probe.get("kwargs", {}),
         }
     ).encode()
-    request = urllib.request.Request(
-        base_url.rstrip("/") + "/api/rpc/call",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    # No proxy: the server is a local published port, and a proxy variable in
-    # the environment would send the call somewhere that cannot reach it.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # http.client, not urllib: no proxy lookup (the server is a local published
+    # port, and a proxy variable would send the call somewhere that cannot
+    # reach it) and no redirect handling to refuse.
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    expired = threading.Event()
+    # Held here because the connection drops its own reference to the socket
+    # once it hands a closing reply to the response.
+    held: list[socket.socket] = []
+
+    def expire() -> None:
+        # A socket timeout restarts on every read, so a reply dripped in small
+        # pieces would outlive --timeout. Shutting the socket down ends
+        # whichever read is blocked, and `expired` says why it ended.
+        expired.set()
+        for sock in held:
+            # Already closed means the blocked read has ended either way.
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+
+    deadline = threading.Timer(timeout, expire)
+    deadline.start()
     try:
-        with opener.open(request, timeout=timeout) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
-        raise ProbeError(f"rpc call returned HTTP {exc.code}") from exc
-    except TimeoutError as exc:
-        raise ProbeError(f"rpc call timed out after {timeout:g}s") from exc
-    except (urllib.error.URLError, OSError) as exc:
+        conn.connect()
+        if conn.sock is not None:
+            held.append(conn.sock)
+        if expired.is_set():
+            raise TimeoutError
+        conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        if 300 <= response.status < 400:
+            raise ProbeError(
+                f"rpc call was redirected (HTTP {response.status}) to {response.getheader('Location')}; not followed"
+            )
+        if not 200 <= response.status < 300:
+            excerpt = _excerpt(response)
+            raise ProbeError(f"rpc call returned HTTP {response.status}" + (f": {excerpt}" if excerpt else ""))
+        raw = response.read()
+    except (TimeoutError, http.client.HTTPException, OSError) as exc:
+        if expired.is_set() or isinstance(exc, TimeoutError):
+            raise ProbeError(f"rpc call timed out after {timeout:g}s") from exc
+        reason = " ".join(f"{type(exc).__name__}: {exc}".split())
+        if isinstance(exc, http.client.HTTPException):
+            raise ProbeError(f"rpc call got a broken HTTP reply: {reason}") from exc
         raise ProbeError(f"rpc call could not reach {base_url}: {exc}") from exc
+    finally:
+        deadline.cancel()
+        conn.close()
     try:
         reply = json.loads(raw)
     except ValueError as exc:
@@ -121,8 +181,16 @@ def call_rpc(base_url: str, probe: dict[str, Any], timeout: float) -> dict[str, 
 def check_result(probe: dict[str, Any], reply: dict[str, Any]) -> str:
     """Returns a one-line description of the passing result, or raises."""
     # A failed call is still HTTP 200, so success is the only signal.
-    if reply.get("success") is not True:
-        raise ProbeError(f"{probe['identity']}.{probe['method']} failed: {reply.get('error', 'no error given')}")
+    call = f"{probe['identity']}.{probe['method']}"
+    success = reply.get("success")
+    if not isinstance(success, bool):
+        problem = (
+            "has no 'success'" if "success" not in reply else f"'success' is {type(success).__name__}, not a boolean"
+        )
+        suffix = f" (error: {reply['error']})" if "error" in reply else ""
+        raise ProbeError(f"{call} reply {problem}{suffix}")
+    if not success:
+        raise ProbeError(f"{call} failed: {reply.get('error') or 'no error given'}")
     if "result" not in reply:
         raise ProbeError(f"{probe['identity']}.{probe['method']} reply has no 'result'")
     result = reply["result"]

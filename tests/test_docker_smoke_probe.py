@@ -7,13 +7,16 @@ and the lines on stdout and stderr are what is asserted.
 from __future__ import annotations
 
 import http.server
+import importlib.util
 import json
+import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -47,6 +50,11 @@ class _RpcServer:
         self.reply: Any = {"success": True, "result": ["x", "y"]}
         self.status = 200
         self.raw: bytes | None = None
+        # Bytes written to the socket as the whole reply, status line included.
+        self.wire: bytes | None = None
+        self.headers: dict[str, str] = {}
+        # Sends the body two bytes at a time, pausing between pieces.
+        self.drip = False
         self.delay = threading.Event()
         self.requests: list[dict[str, Any]] = []
 
@@ -57,12 +65,27 @@ class _RpcServer:
                 if outer.delay.is_set():
                     # Longer than any client timeout in these tests.
                     threading.Event().wait(2)
+                if outer.wire is not None:
+                    self.wfile.write(outer.wire)
+                    return
                 body = outer.raw if outer.raw is not None else json.dumps(outer.reply).encode()
                 self.send_response(outer.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
+                for name, value in outer.headers.items():
+                    self.send_header(name, value)
                 self.end_headers()
-                self.wfile.write(body)
+                if not outer.drip:
+                    self.wfile.write(body)
+                    return
+                try:
+                    for start in range(0, len(body), 2):
+                        self.wfile.write(body[start : start + 2])
+                        self.wfile.flush()
+                        threading.Event().wait(0.3)
+                except OSError:
+                    # The client gave up on the slow reply, which is what the test wants.
+                    return
 
             def log_message(self, *args: Any) -> None:
                 return
@@ -75,8 +98,7 @@ class _RpcServer:
         return f"http://127.0.0.1:{self.server.server_address[1]}"
 
 
-@pytest.fixture
-def rpc_server() -> Iterator[_RpcServer]:
+def _serving() -> Iterator[_RpcServer]:
     server = _RpcServer()
     server.thread.start()
     try:
@@ -87,15 +109,33 @@ def rpc_server() -> Iterator[_RpcServer]:
         server.server.server_close()
 
 
+@pytest.fixture
+def rpc_server() -> Iterator[_RpcServer]:
+    yield from _serving()
+
+
+@pytest.fixture
+def other_server() -> Iterator[_RpcServer]:
+    """A second server, for a request that must never reach it."""
+    yield from _serving()
+
+
 def _write_probe(tmp_path: Path, probe: Any) -> Path:
     path = tmp_path / "smoke-probe.json"
     path.write_text(probe if isinstance(probe, str) else json.dumps(probe), encoding="utf-8")
     return path
 
 
-def _probe(probe_file: Path, url: str, *extra: str, python: str = sys.executable) -> subprocess.CompletedProcess[str]:
+def _probe(
+    probe_file: Path,
+    url: str,
+    *extra: str,
+    python: str = sys.executable,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [python, str(INTERPRETER), str(probe_file), url, *extra],
+        env={**os.environ, **(env or {})},
         capture_output=True,
         text=True,
         timeout=30,
@@ -134,10 +174,12 @@ def test_args_and_kwargs_default_to_empty(tmp_path: Path, rpc_server: _RpcServer
     }
 
 
-def test_the_host_python3_runs_it_too(tmp_path: Path, rpc_server: _RpcServer) -> None:
-    host_python = shutil.which("python3")
-    assert host_python is not None
-    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url, python=host_python)
+def test_the_python3_on_path_which_smoke_sh_invokes_runs_it(tmp_path: Path, rpc_server: _RpcServer) -> None:
+    # The same interpreter as pytest's when a venv is on PATH; a different one
+    # only where the host's python3 is another version.
+    path_python = shutil.which("python3")
+    assert path_python is not None
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url, python=path_python)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "probe ok: demo.agent list_things" in result.stdout
 
@@ -162,18 +204,64 @@ def test_a_result_that_misses_expect_fails_with_the_reason(
     assert message in result.stderr, result.stderr
 
 
-@pytest.mark.parametrize("success", [False, "true", 1, None])
-def test_success_must_be_exactly_true_and_the_agent_error_is_printed(
-    tmp_path: Path, rpc_server: _RpcServer, success: Any
+def test_a_false_success_prints_the_agent_error_and_a_result_does_not_rescue_it(
+    tmp_path: Path, rpc_server: _RpcServer
 ) -> None:
     # A failure is still HTTP 200; a result list that would satisfy expect
     # must not rescue it.
-    rpc_server.reply = {"success": success, "error": "Method nope not found or not exported", "result": ["x", "y"]}
+    rpc_server.reply = {"success": False, "error": "Method nope not found or not exported", "result": ["x", "y"]}
     result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url)
     assert result.returncode == 1
     assert result.stderr.strip() == (
         "probe failed: demo.agent.list_things failed: Method nope not found or not exported"
     )
+
+
+@pytest.mark.parametrize("error", [pytest.param(None, id="null"), pytest.param("", id="empty")])
+def test_a_false_success_without_a_usable_error_says_no_error_was_given(
+    tmp_path: Path, rpc_server: _RpcServer, error: Any
+) -> None:
+    rpc_server.reply = {"success": False, "error": error}
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url)
+    assert result.stderr.strip() == "probe failed: demo.agent.list_things failed: no error given"
+    rpc_server.reply = {"success": False}
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url)
+    assert result.stderr.strip() == "probe failed: demo.agent.list_things failed: no error given"
+
+
+@pytest.mark.parametrize(
+    ("reply", "message"),
+    [
+        pytest.param({"result": ["x", "y"]}, "demo.agent.list_things reply has no 'success'", id="missing"),
+        pytest.param(
+            {"success": "true", "result": ["x", "y"]},
+            "demo.agent.list_things reply 'success' is str, not a boolean",
+            id="string",
+        ),
+        pytest.param(
+            {"success": 1, "result": ["x", "y"]},
+            "demo.agent.list_things reply 'success' is int, not a boolean",
+            id="int",
+        ),
+        pytest.param(
+            {"success": None, "result": ["x", "y"]},
+            "demo.agent.list_things reply 'success' is NoneType, not a boolean",
+            id="null",
+        ),
+        pytest.param(
+            {"success": "no", "error": "agent said so"},
+            "demo.agent.list_things reply 'success' is str, not a boolean (error: agent said so)",
+            id="with-error",
+        ),
+    ],
+)
+def test_a_missing_or_non_boolean_success_is_named_as_such(
+    tmp_path: Path, rpc_server: _RpcServer, reply: dict[str, Any], message: str
+) -> None:
+    rpc_server.reply = reply
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url)
+    assert result.returncode == 1
+    assert result.stderr.strip() == f"probe failed: {message}"
 
 
 def test_a_bool_does_not_satisfy_an_int_expect(tmp_path: Path, rpc_server: _RpcServer) -> None:
@@ -182,6 +270,41 @@ def test_a_bool_does_not_satisfy_an_int_expect(tmp_path: Path, rpc_server: _RpcS
     result = _probe(_write_probe(tmp_path, probe), rpc_server.url)
     assert result.returncode == 1
     assert "result is bool, expected int" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("kind", "good", "short"),
+    [
+        pytest.param("list", ["a"], [], id="list"),
+        pytest.param("dict", {"a": 1}, {}, id="dict"),
+        pytest.param("str", "a", "", id="str"),
+    ],
+)
+def test_min_length_applies_to_every_sized_type(
+    tmp_path: Path, rpc_server: _RpcServer, kind: str, good: Any, short: Any
+) -> None:
+    probe = _write_probe(tmp_path, {**RPC_PROBE, "expect": {"type": kind, "min_length": 1}})
+    rpc_server.reply = {"success": True, "result": good}
+    passed = _probe(probe, rpc_server.url)
+    assert passed.returncode == 0, passed.stderr
+    assert passed.stdout.strip() == f"probe ok: demo.agent list_things: {kind} length 1"
+    rpc_server.reply = {"success": True, "result": short}
+    failed = _probe(probe, rpc_server.url)
+    assert failed.returncode == 1
+    assert "result length 0 is below min_length 1" in failed.stderr
+
+
+@pytest.mark.parametrize("value", [pytest.param(7, id="int"), pytest.param(7.5, id="float")])
+def test_a_float_expect_accepts_an_int_and_a_float_but_not_a_bool(
+    tmp_path: Path, rpc_server: _RpcServer, value: Any
+) -> None:
+    probe = _write_probe(tmp_path, {**RPC_PROBE, "expect": {"type": "float"}})
+    rpc_server.reply = {"success": True, "result": value}
+    passed = _probe(probe, rpc_server.url)
+    assert passed.returncode == 0, passed.stderr
+    assert passed.stdout.strip() == "probe ok: demo.agent list_things: float value ok"
+    rpc_server.reply = {"success": True, "result": True}
+    assert "result is bool, expected float" in _probe(probe, rpc_server.url).stderr
 
 
 def test_a_scalar_expect_without_min_length_passes(tmp_path: Path, rpc_server: _RpcServer) -> None:
@@ -208,6 +331,7 @@ def test_a_scalar_expect_without_min_length_passes(tmp_path: Path, rpc_server: _
             {k: v for k, v in RPC_PROBE.items() if k != "expect"}, "missing an object 'expect'", id="no-expect"
         ),
         pytest.param({**RPC_PROBE, "kind": "mqtt"}, "unknown probe kind 'mqtt'", id="unknown-kind"),
+        pytest.param({**RPC_PROBE, "kwarg": {"k": "v"}}, "unknown probe keys ['kwarg']", id="unknown-key"),
         pytest.param({**RPC_PROBE, "args": "x"}, "'args' must be a list", id="args-type"),
         pytest.param({**RPC_PROBE, "kwargs": []}, "'kwargs' must be an object", id="kwargs-type"),
         pytest.param({**RPC_PROBE, "expect": {"type": "tuple"}}, "expect.type must be one of", id="expect-type"),
@@ -294,6 +418,106 @@ def test_a_slow_server_fails_with_a_timeout(tmp_path: Path, rpc_server: _RpcServ
     result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url, "--timeout", "0.3")
     assert result.returncode == 1
     assert "rpc call timed out after 0.3s" in result.stderr, result.stderr
+
+
+def test_the_default_timeout_outlasts_the_servers_own_rpc_timeout() -> None:
+    spec = importlib.util.spec_from_file_location("smoke_probe_under_test", INTERPRETER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server_rpc_timeout = 30
+    assert module.DEFAULT_TIMEOUT > server_rpc_timeout
+
+
+def test_the_timeout_bounds_the_whole_call_not_each_read(tmp_path: Path, rpc_server: _RpcServer) -> None:
+    # The reply takes about 5.7 s to arrive in pieces, each well inside one read timeout.
+    rpc_server.drip = True
+    started = time.monotonic()
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url, "--timeout", "1")
+    elapsed = time.monotonic() - started
+    assert result.returncode == 1
+    assert result.stderr.strip() == "probe failed: rpc call timed out after 1s"
+    assert elapsed < 4, elapsed
+
+
+@pytest.mark.parametrize(
+    ("wire", "name"),
+    [
+        pytest.param(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort", "IncompleteRead", id="short-body"),
+        pytest.param(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", "IncompleteRead", id="broken-chunk"
+        ),
+        pytest.param(b"garbage\r\n\r\n", "BadStatusLine", id="bad-status-line"),
+        pytest.param(b"", "RemoteDisconnected", id="closed-without-reply"),
+    ],
+)
+def test_a_broken_http_reply_fails_as_a_named_probe_failure_not_a_traceback(
+    tmp_path: Path, rpc_server: _RpcServer, wire: bytes, name: str
+) -> None:
+    rpc_server.wire = wire
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url)
+    assert result.returncode == 1
+    assert result.stdout == ""
+    lines = result.stderr.splitlines()
+    assert len(lines) == 1, result.stderr
+    assert lines[0].startswith(f"probe failed: rpc call got a broken HTTP reply: {name}"), result.stderr
+
+
+@pytest.mark.parametrize("status", [302, 303, 307])
+def test_a_redirect_is_refused_by_name_and_never_followed(
+    tmp_path: Path, rpc_server: _RpcServer, other_server: _RpcServer, status: int
+) -> None:
+    target = f"{other_server.url}/api/rpc/call"
+    rpc_server.status = status
+    rpc_server.headers = {"Location": target}
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url)
+    assert result.returncode == 1
+    assert result.stderr.strip() == f"probe failed: rpc call was redirected (HTTP {status}) to {target}; not followed"
+    assert len(rpc_server.requests) == 1
+    assert other_server.requests == []
+
+
+def test_proxy_environment_variables_are_ignored(tmp_path: Path, rpc_server: _RpcServer) -> None:
+    # A proxy that is not listening: a probe that honored these would fail.
+    dead_proxy = _closed_port_url()
+    env = dict.fromkeys(("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"), dead_proxy)
+    env.update({"no_proxy": "", "NO_PROXY": ""})
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(rpc_server.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(b"database is down\n", "rpc call returned HTTP 500: database is down", id="body"),
+        pytest.param(b"line one\r\n  line   two\n", "rpc call returned HTTP 500: line one line two", id="whitespace"),
+        pytest.param(b"", "rpc call returned HTTP 500", id="empty"),
+    ],
+)
+def test_an_http_error_carries_the_start_of_its_body(
+    tmp_path: Path, rpc_server: _RpcServer, raw: bytes, expected: str
+) -> None:
+    rpc_server.status = 500
+    rpc_server.raw = raw
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url)
+    assert result.returncode == 1
+    assert result.stderr.strip() == f"probe failed: {expected}"
+
+
+def test_a_long_http_error_body_is_cut_to_a_short_excerpt(tmp_path: Path, rpc_server: _RpcServer) -> None:
+    rpc_server.status = 500
+    rpc_server.raw = b"x" * 5000
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), rpc_server.url)
+    assert result.stderr.startswith("probe failed: rpc call returned HTTP 500: xxx")
+    assert len(result.stderr) < 300, len(result.stderr)
+
+
+@pytest.mark.parametrize("url", ["ftp://127.0.0.1:1", "127.0.0.1:1", "http://", "http://127.0.0.1:notaport"])
+def test_a_base_url_that_is_not_http_host_port_is_refused_by_name(tmp_path: Path, url: str) -> None:
+    result = _probe(_write_probe(tmp_path, RPC_PROBE), url)
+    assert result.returncode == 1
+    assert result.stderr.startswith("probe failed: base URL "), result.stderr
 
 
 # --- the two probe files smoke.sh runs. ------------------------------------

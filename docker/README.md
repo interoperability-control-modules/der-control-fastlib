@@ -87,8 +87,9 @@ environment; an environment value always wins over the `.env` file.
 `make stack-smoke` runs `docker/smoke.sh` over the server and every directory
 in `AGENT_DIRS`. It proves the server is healthy, each agent registers its
 identity (`platform.presentation`, `der.rtc`), each agent answers its job
-probe (below), the `der.rtc` agent leaves and rejoins within 10 s of a stop and start with a new `StartedAt`, and nothing
-labelled or named `derhost-smoke` is left afterwards (the count is printed).
+probe (below), the `der.rtc` agent leaves and rejoins within 10 s of a stop
+and start with a new `StartedAt`, and nothing labelled or named
+`derhost-smoke` is left afterwards (the count is printed).
 
 Each agent directory has a `compose.smoke.yml` overlay: project, container
 and image tag (`:smoke`) differ from its base file, and the agent joins the
@@ -122,12 +123,20 @@ one fails the run. `docker/lib/smoke_probe.py` (standard library, run by host
 ```
 
 `identity` must equal the `--identity` in the agent's Dockerfile. `kind: rpc`
-calls `POST /api/rpc/call` with `agent_id`, `method`, `args` and optional
-`kwargs`. A failed call still answers HTTP 200 with `success: false` and an
-`error`, so the probe passes only on `success: true` and a `result` that
-meets `expect` (`type`: list, dict, str, int, float or bool; `min_length`:
-list, dict or str only). `kind: topic` is refused with a named error: it
-needs a WebSocket client and neither agent publishes.
+calls `POST /api/rpc/call` with `agent_id`, `method`, and `args` and
+`kwargs`, both optional (default `[]` and `{}`). Keys other than `identity`,
+`kind`, `method`, `args`, `kwargs` and `expect` are refused. A failed call
+still answers HTTP 200 with `success: false` and an `error`, so the probe
+passes only on `success: true` and a `result` that meets `expect` (`type`:
+list, dict, str, int, float or bool; `min_length`: list, dict or str only).
+`kind: topic` is refused with a named error: it needs a WebSocket client and
+neither agent publishes.
+
+The interpreter ignores proxy environment variables, refuses a redirect
+rather than following it, and bounds the whole call (not each read) by
+`--timeout`, which defaults to 35 s, above the server's own 30 s RPC timeout.
+A directory without `smoke-probe.json` is refused with the other directory
+checks, before anything is built.
 
 Timeouts, all in seconds and all set through the environment:
 
