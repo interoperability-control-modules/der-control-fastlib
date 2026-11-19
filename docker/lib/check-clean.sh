@@ -18,6 +18,11 @@ main() {
     exit 0
   fi
 
+  if [ ! -e "${checkout}" ]; then
+    echo "check-clean: ${checkout} does not exist" >&2
+    exit 1
+  fi
+
   if ! git -C "${checkout}" rev-parse --git-dir >/dev/null 2>&1; then
     echo "check-clean: ${checkout} is not a git checkout" >&2
     exit 1

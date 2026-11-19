@@ -81,7 +81,7 @@ AGENT_CMD=()
 agent_compose_cmd() {
     local dir="$1" timeout_secs="$2"
     shift 2
-    AGENT_CMD=(timeout -k "$KILL_GRACE" "$timeout_secs" env DER_AGENT_SRC=unused docker compose -p "derhost-smoke-$dir"
+    AGENT_CMD=(timeout -k "$KILL_GRACE" "$timeout_secs" env DER_AGENT_SRC=/dev/null/no-build docker compose -p "derhost-smoke-$dir"
         -f "$SCRIPT_DIR/$dir/docker-compose.yml" -f "$SCRIPT_DIR/$dir/compose.smoke.yml"
         --project-directory "$SCRIPT_DIR/$dir" "$@")
 }

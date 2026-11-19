@@ -67,6 +67,15 @@ def test_allow_dirty_bypasses_the_refusal(scratch_checkout: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_missing_checkout_path_is_named_as_missing(tmp_path: Path) -> None:
+    # A path that does not exist is a different mistake from a directory that
+    # is not a repository, and the message must not blur the two (#86).
+    result = _run_check_clean(tmp_path / "no-such-checkout")
+    assert result.returncode == 1
+    assert "does not exist" in result.stderr
+    assert "not a git checkout" not in result.stderr
+
+
 def test_non_git_checkout_is_refused(tmp_path: Path) -> None:
     not_a_repo = tmp_path / "not-a-repo"
     not_a_repo.mkdir()
@@ -245,6 +254,41 @@ def test_compose_refuses_to_resolve_without_der_agent_src() -> None:
 def test_compose_resolves_once_der_agent_src_is_set() -> None:
     # Control: the refusal above is a missing-variable check, not a broken
     # compose file; setting the variable must let resolution proceed.
-    result = _run_compose_config("unused")
+    result = _run_compose_config("/dev/null/no-build")
     assert result.returncode == 0, result.stderr
     assert "agent_src:" in result.stdout
+
+
+def _placeholder_from_env_example(agent: str) -> str:
+    for line in (REPO_ROOT / "docker" / agent / ".env.example").read_text().splitlines():
+        if line.startswith("#DER_AGENT_SRC="):
+            return line.removeprefix("#DER_AGENT_SRC=")
+    raise AssertionError(f"no #DER_AGENT_SRC= line in docker/{agent}/.env.example")
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="requires the docker CLI")
+@pytest.mark.parametrize("agent", ["interoperability-service", "realtime-control-agent"])
+def test_the_der_agent_src_placeholder_never_resolves_to_a_directory(agent: str, tmp_path: Path) -> None:
+    # Compose resolves a relative additional_contexts value against the
+    # project directory, so a placeholder like "unused" becomes a real build
+    # context when a directory of that name exists there (#86). The copy
+    # carries such a directory when the placeholder is relative; the placeholder
+    # must not resolve to a directory either way.
+    project = tmp_path / agent
+    project.mkdir()
+    shutil.copy(REPO_ROOT / "docker" / agent / "docker-compose.yml", project / "docker-compose.yml")
+    placeholder = _placeholder_from_env_example(agent)
+    if not os.path.isabs(placeholder):
+        (project / placeholder).mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, DER_AGENT_SRC=placeholder)
+    result = subprocess.run(
+        ["docker", "compose", "-f", str(project / "docker-compose.yml"), "config"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    resolved = [ln.split("agent_src:", 1)[1].strip() for ln in result.stdout.splitlines() if "agent_src:" in ln]
+    assert len(resolved) == 1, result.stdout
+    assert not Path(resolved[0]).is_dir(), resolved[0]
