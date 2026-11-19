@@ -5,6 +5,7 @@ docker-compose.yml's required DER_AGENT_SRC (#68)."""
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -82,6 +83,60 @@ def test_non_git_checkout_is_refused(tmp_path: Path) -> None:
     result = _run_check_clean(not_a_repo)
     assert result.returncode == 1
     assert "not a git checkout" in result.stderr
+
+
+def test_allow_dirty_still_refuses_a_missing_path(tmp_path: Path) -> None:
+    # ALLOW_DIRTY bypasses only the dirtiness check (#148).
+    result = _run_check_clean(tmp_path / "no-such-checkout", allow_dirty="1")
+    assert result.returncode == 1
+    assert "does not exist" in result.stderr
+    assert "skipping" not in result.stderr
+
+
+def test_allow_dirty_still_refuses_a_non_git_path(tmp_path: Path) -> None:
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.mkdir()
+    result = _run_check_clean(not_a_repo, allow_dirty="1")
+    assert result.returncode == 1
+    assert "not a git checkout" in result.stderr
+    assert "skipping" not in result.stderr
+
+
+def test_subdirectory_of_a_work_tree_is_refused(scratch_checkout: Path) -> None:
+    # build-agent.sh archives HEAD of the path it is given; from a
+    # subdirectory that would silently archive only the subtree (#148).
+    sub = scratch_checkout / "pkg"
+    sub.mkdir()
+    (sub / "mod.py").write_text("# placeholder\n")
+    _git(scratch_checkout, "add", "pkg/mod.py")
+    _git(scratch_checkout, "commit", "-q", "-m", "add pkg")
+    result = _run_check_clean(sub)
+    assert result.returncode == 1
+    assert "subdirectory" in result.stderr
+    assert str(scratch_checkout.resolve()) in result.stderr
+
+
+def test_allow_dirty_still_refuses_a_subdirectory(scratch_checkout: Path) -> None:
+    sub = scratch_checkout / "pkg"
+    sub.mkdir()
+    result = _run_check_clean(sub, allow_dirty="1")
+    assert result.returncode == 1
+    assert "subdirectory" in result.stderr
+    assert "skipping" not in result.stderr
+
+
+def test_symlink_to_the_top_of_a_work_tree_passes(scratch_checkout: Path, tmp_path: Path) -> None:
+    # The top is compared after `pwd -P`, so a symlink to it is still its top.
+    link = tmp_path / "link-to-checkout"
+    link.symlink_to(scratch_checkout)
+    result = _run_check_clean(link)
+    assert result.returncode == 0, result.stderr
+
+
+def test_allow_dirty_on_a_clean_top_level_checkout_still_skips(scratch_checkout: Path) -> None:
+    result = _run_check_clean(scratch_checkout, allow_dirty="1")
+    assert result.returncode == 0, result.stderr
+    assert "skipping" in result.stderr
 
 
 # --- build.sh: archive isolation, committed-content-only, dirty labeling ---
@@ -259,25 +314,46 @@ def test_compose_resolves_once_der_agent_src_is_set() -> None:
     assert "agent_src:" in result.stdout
 
 
-def _placeholder_from_env_example(agent: str) -> str:
-    for line in (REPO_ROOT / "docker" / agent / ".env.example").read_text().splitlines():
-        if line.startswith("#DER_AGENT_SRC="):
-            return line.removeprefix("#DER_AGENT_SRC=")
-    raise AssertionError(f"no #DER_AGENT_SRC= line in docker/{agent}/.env.example")
+_DOCKER_DIR = REPO_ROOT / "docker"
+_PLACEHOLDER_ASSIGNMENT = re.compile(r"DER_AGENT_SRC=([^\s\"\\]+)")
+_PLACEHOLDER_SITES = ["env-example", "docker.mk", "smoke.sh"]
+
+
+def _placeholders_set_at(site: str, agent: str) -> list[str]:
+    """Every placeholder value the named file sets, read from the file."""
+    if site == "env-example":
+        path = _DOCKER_DIR / agent / ".env.example"
+        prefix = "#DER_AGENT_SRC="
+        values = [ln.removeprefix(prefix) for ln in path.read_text().splitlines() if ln.startswith(prefix)]
+    else:
+        path = _DOCKER_DIR / site
+        values = [
+            m.group(1)
+            for ln in path.read_text().splitlines()
+            if not ln.lstrip().startswith("#")
+            for m in _PLACEHOLDER_ASSIGNMENT.finditer(ln)
+        ]
+    assert values, f"no DER_AGENT_SRC= assignment in {path}"
+    return values
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="requires the docker CLI")
+@pytest.mark.parametrize("site", _PLACEHOLDER_SITES)
 @pytest.mark.parametrize("agent", ["interoperability-service", "realtime-control-agent"])
-def test_the_der_agent_src_placeholder_never_resolves_to_a_directory(agent: str, tmp_path: Path) -> None:
+def test_the_der_agent_src_placeholder_never_resolves_to_a_directory(site: str, agent: str, tmp_path: Path) -> None:
     # Compose resolves a relative additional_contexts value against the
     # project directory, so a placeholder like "unused" becomes a real build
     # context when a directory of that name exists there (#86). The copy
     # carries such a directory when the placeholder is relative; the placeholder
     # must not resolve to a directory either way.
-    project = tmp_path / agent
-    project.mkdir()
+    for index, placeholder in enumerate(_placeholders_set_at(site, agent)):
+        _assert_placeholder_is_not_a_directory(agent, placeholder, tmp_path / str(index))
+
+
+def _assert_placeholder_is_not_a_directory(agent: str, placeholder: str, base: Path) -> None:
+    project = base / agent
+    project.mkdir(parents=True)
     shutil.copy(REPO_ROOT / "docker" / agent / "docker-compose.yml", project / "docker-compose.yml")
-    placeholder = _placeholder_from_env_example(agent)
     if not os.path.isabs(placeholder):
         (project / placeholder).mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, DER_AGENT_SRC=placeholder)
@@ -291,4 +367,4 @@ def test_the_der_agent_src_placeholder_never_resolves_to_a_directory(agent: str,
     assert result.returncode == 0, result.stderr
     resolved = [ln.split("agent_src:", 1)[1].strip() for ln in result.stdout.splitlines() if "agent_src:" in ln]
     assert len(resolved) == 1, result.stdout
-    assert not Path(resolved[0]).is_dir(), resolved[0]
+    assert not Path(resolved[0]).is_dir(), (placeholder, resolved[0])
