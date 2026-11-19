@@ -295,9 +295,9 @@ def test_stack_up_all_default_builds_and_starts_the_server_then_both_agents(dock
     sibling_checkouts = {str(tree.parent / "interoperability-service"), str(tree.parent / "realtime-control-agent")}
     for sub, _, der_agent_src, call in events:
         if sub == "build":
-            assert der_agent_src != "unused" and der_agent_src not in sibling_checkouts, der_agent_src
+            assert der_agent_src != "/dev/null/no-build" and der_agent_src not in sibling_checkouts, der_agent_src
         else:
-            assert der_agent_src == "unused", der_agent_src
+            assert der_agent_src == "/dev/null/no-build", der_agent_src
             assert "--no-build" in call and "--build" not in call, call
     assert set(_load_results(docker_stub)) == {"build rc=0", "up rc=0"}
 

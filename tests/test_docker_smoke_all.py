@@ -382,7 +382,7 @@ def test_agents_build_and_start_without_the_developers_der_agent_src(
         ln for ln in lines if "derhost-smoke-" in ln and "ARGS: compose" in ln and "--project-directory" in ln
     ]
     assert len(agent_compose) >= len(AGENTS), lines
-    assert all("DER_AGENT_SRC=unused" in ln for ln in agent_compose), agent_compose
+    assert all("DER_AGENT_SRC=/dev/null/no-build" in ln for ln in agent_compose), agent_compose
 
 
 def test_restart_shows_the_identity_absent_then_connected_with_a_new_started_at(
@@ -1102,7 +1102,7 @@ def _compose_config(project_dir: Path, files: list[Path], project: str | None = 
     env = os.environ.copy()
     for key in _SMOKE_ENV_KEYS:
         env.pop(key, None)
-    env["DER_AGENT_SRC"] = "unused"
+    env["DER_AGENT_SRC"] = "/dev/null/no-build"
     cmd = ["docker", "compose"]
     if project:
         cmd += ["-p", project]

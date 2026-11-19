@@ -56,6 +56,12 @@ Run from the repository root.
   identities in `EXPECTED` (comma-separated) are connected; `EXPECTED=`
   (the default) trivially passes.
 
+Agent dependency pinning: each agent's `requirements.txt` keeps open version
+ranges for now. Pinning one file buys little while the base image, the pip
+tooling and the der-control-fastlib install under it also resolve at build
+time, so one policy has to cover the whole image chain. That policy is
+tracked in issue 140.
+
 `stack-up` refuses before touching Docker when `DERHOST_PUBLISH_HOST` is not
 a usable value, or when host port 5410 is already bound.
 

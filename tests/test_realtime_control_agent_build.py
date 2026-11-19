@@ -292,7 +292,7 @@ def test_compose_refuses_to_resolve_without_der_agent_src() -> None:
 
 
 def test_compose_resolves_once_der_agent_src_is_set() -> None:
-    result = _run_compose_config("unused")
+    result = _run_compose_config("/dev/null/no-build")
     assert result.returncode == 0, result.stderr
     assert "agent_src:" in result.stdout
 
