@@ -136,11 +136,73 @@ def test_config_example_use_cases_is_empty() -> None:
     assert config["use_cases"] == []
 
 
-def test_config_example_modes_is_empty() -> None:
-    # No mode is configured: rt_control.modes.novel imports julia at module
-    # scope (es_control_mode.py:2 at 6ea0e71), and this image installs no Julia.
-    config = json.loads((AGENT_DIR / "config.example.json").read_text(encoding="utf-8"))
-    assert config["modes"] == []
+# Mode modules under rt_control/modes/reactive at 6ea0e71 carry no Julia code.
+NATIVE_REACTIVE_MODES = frozenset(
+    {
+        "ConstantVar",
+        "FixedPowerFactor",
+        "VoltVar",
+        "WattVar",
+        "PowerFactorCorrection",
+        "DynamicReactiveCurrentSupport",
+    }
+)
+
+
+def _example_config() -> dict:
+    return json.loads((AGENT_DIR / "config.example.json").read_text(encoding="utf-8"))
+
+
+def check_modes_are_one_native_constant_var(modes: list[dict]) -> None:
+    # rt_control.modes.novel imports julia at module scope
+    # (es_control_mode.py:2 at 6ea0e71) and this image installs no Julia, so
+    # the single configured mode must come from the native reactive set.
+    if len(modes) != 1:
+        raise AssertionError(f"expected exactly one mode, got {len(modes)}: {modes!r}")
+    mode = modes[0]
+    if mode.get("class_name") not in NATIVE_REACTIVE_MODES:
+        raise AssertionError(f"mode is not a native reactive mode: {mode!r}")
+    if mode.get("class_name") != "ConstantVar":
+        raise AssertionError(f"mode is not ConstantVar: {mode!r}")
+    if "module_name" in mode and "modes.novel" in str(mode["module_name"]):
+        raise AssertionError(f"mode comes from rt_control/modes/novel: {mode!r}")
+    if mode.get("use_julia"):
+        raise AssertionError(f"mode sets use_julia: {mode!r}")
+    if mode.get("priority") != 1:
+        raise AssertionError(f"priority is not 1: {mode!r}")
+    if mode.get("reactive_power_target") != 10.0:
+        raise AssertionError(f"reactive_power_target is not 10.0: {mode!r}")
+
+
+def test_config_example_configures_one_native_constant_var_mode() -> None:
+    config = _example_config()
+    check_modes_are_one_native_constant_var(config["modes"])
+    assert config["modes"] == [{"class_name": "ConstantVar", "priority": 1, "reactive_power_target": 10.0}]
+
+
+GOOD_MODE = {"class_name": "ConstantVar", "priority": 1, "reactive_power_target": 10.0}
+
+
+@pytest.mark.parametrize(
+    "modes, message",
+    [
+        ([], "exactly one mode"),
+        ([GOOD_MODE, GOOD_MODE], "exactly one mode"),
+        ([{**GOOD_MODE, "class_name": "Pid"}], "not a native reactive mode"),
+        ([{**GOOD_MODE, "class_name": "VoltVar"}], "not ConstantVar"),
+        (
+            [{**GOOD_MODE, "module_name": "rt_control.modes.novel.pid"}],
+            "modes/novel",
+        ),
+        ([{**GOOD_MODE, "use_julia": True}], "use_julia"),
+        ([{**GOOD_MODE, "priority": 2}], "priority is not 1"),
+        ([{**GOOD_MODE, "reactive_power_target": 50.0}], "reactive_power_target"),
+    ],
+)
+def test_check_modes_fixture_fails(modes: list[dict], message: str) -> None:
+    # Control: each assertion above goes red on a config that breaks it (#97).
+    with pytest.raises(AssertionError, match=message):
+        check_modes_are_one_native_constant_var(modes)
 
 
 def test_dockerfile_bakes_config_at_the_path_start_legacy_resolves() -> None:

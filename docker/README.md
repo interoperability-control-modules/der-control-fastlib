@@ -14,8 +14,14 @@ land in earlier PRs; `docker/realtime-control-agent/` runs native control
 modes only, with no Julia in the image (operator decision, #68): its baked-in
 `config.example.json` sets no mode's `use_julia` to true.
 
-With that config the image runs no control mode: `modes` and `use_cases` are
-both empty.
+With that config the image runs one mode, `ConstantVar`, at 10 percent of
+maximum reactive power (priority 1); `use_cases` is empty.
+
+A configured mode that needs Julia fails in one of two ways, and in both the
+container stays healthy, because its healthcheck only reads PID 1 (#132): a
+mode with `use_julia: true` loads but raises `ModuleNotFoundError` on every
+tick, and a Julia-only mode (anything under `rt_control/modes/novel`) fails
+at configuration, so the control loop never starts.
 
 If a configured mode ever sets `use_julia: true` with no `julia` package
 installed, the agent does not crash or refuse to start: the import happens
