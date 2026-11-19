@@ -526,6 +526,7 @@ def test_no_host_namespace_fixture_fails_pid() -> None:
         ({"uts": "host"}, "uts"),
         ({"cgroup": "host"}, "cgroup"),
         ({"pid": "${USER:+host}"}, "pid must not be interpolated"),
+        ({"pid": "h${X:-ost}"}, "pid must not be interpolated"),
         ({"network_mode": "${USER:+host}"}, "network_mode must not be interpolated"),
         ({"ipc": "${X:-host}"}, "ipc must not be interpolated"),
         ({"uts": "$X"}, "uts must not be interpolated"),
