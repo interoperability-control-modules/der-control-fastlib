@@ -186,8 +186,10 @@ def _is_volume_name(source: Any) -> bool:
 
 
 # `c:/etc:/x` splits at its first colon into the name `c`, but Compose reads
-# a drive letter followed by a slash as a host path.
-_DRIVE_PATH = re.compile(r"[a-zA-Z]:[/\\]")
+# a drive letter followed by a slash as a host path, and `c:etc:/y` as a bind
+# of `<project>/c:etc`. A one-letter source followed by a colon is refused
+# whatever follows it.
+_DRIVE_PATH = re.compile(r"[a-zA-Z]:")
 
 
 def check_named_volumes_only(name: str, service: dict[str, Any]) -> None:
@@ -290,6 +292,8 @@ _REFUSED_MOUNTS = [
     "derhost-home/x:/x",
     "derhost$D:/x",
     "c:/etc:/x",
+    "c:etc:/y",
+    "c:y:/z",
     "C:\\Windows:/x",
     {"type": "bind", "source": "/etc", "target": "/e"},
     {"type": "volume", "source": "/etc", "target": "/e"},
@@ -465,6 +469,14 @@ _UNCONFINED_SECURITY_OPTS = tuple(
 
 
 def check_no_host_namespace(name: str, service: dict[str, Any]) -> None:
+    # A value built by interpolation (`${USER:+host}`) is whatever the deploy
+    # shell makes it, so it is refused as the mount rule refuses `$` in a source.
+    for key in ("network_mode", "pid", "ipc", "uts", "userns_mode", "cgroup"):
+        if "$" in str(service.get(key) or ""):
+            raise AssertionError(f"{name}: {key} must not be interpolated: {service[key]!r}")
+    for option in service.get("security_opt") or []:
+        if "$" in str(option):
+            raise AssertionError(f"{name}: security_opt must not be interpolated: {option!r}")
     if service.get("network_mode") == "host":
         raise AssertionError(f"{name}: network_mode: host must not be set")
     if service.get("pid") == "host":
@@ -513,6 +525,15 @@ def test_no_host_namespace_fixture_fails_pid() -> None:
         ({"userns_mode": "host"}, "userns_mode"),
         ({"uts": "host"}, "uts"),
         ({"cgroup": "host"}, "cgroup"),
+        ({"pid": "${USER:+host}"}, "pid must not be interpolated"),
+        ({"network_mode": "${USER:+host}"}, "network_mode must not be interpolated"),
+        ({"ipc": "${X:-host}"}, "ipc must not be interpolated"),
+        ({"uts": "$X"}, "uts must not be interpolated"),
+        ({"userns_mode": "${X:-host}"}, "userns_mode must not be interpolated"),
+        ({"cgroup": "${X:-host}"}, "cgroup must not be interpolated"),
+        ({"network_mode": "${X:-container:other}"}, "network_mode must not be interpolated"),
+        ({"security_opt": ["${USER:+seccomp=unconfined}"]}, "security_opt must not be interpolated"),
+        ({"security_opt": ["no-new-privileges:true", "label=${X:-disable}"]}, "security_opt must not be interpolated"),
         ({"network_mode": "container:other"}, "network_mode"),
         ({"network_mode": "service:other"}, "network_mode"),
         ({"pid": "container:other"}, "pid"),
@@ -725,7 +746,8 @@ def _declared_secret_names(service: dict[str, Any]) -> set[str]:
     for entry in service.get("secrets") or []:
         declared = (entry.get("target") or entry.get("source")) if isinstance(entry, dict) else entry
         if declared:
-            names.add(str(declared))
+            # Compose prints a long-form target as the absolute path it mounts at.
+            names.add(str(declared).removeprefix(_SECRETS_DIR))
     return names
 
 
@@ -799,6 +821,8 @@ def test_no_secret_env_fixture_fails_password() -> None:
         ({"RETRY_TOKEN_COUNT": "3"}, []),
         ({"ADMIN_PASSWORD_LENGTH": "32"}, []),
         ({"VOLTTRON_HOME": "/var/volttron"}, []),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, [{"source": "jwt", "target": "/run/secrets/jwt"}]),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, [{"source": "other", "target": "jwt"}]),
     ],
 )
 def test_secret_env_allowances_pass(environment: Any, secrets: list[Any]) -> None:
@@ -817,6 +841,8 @@ def test_secret_env_allowances_pass(environment: Any, secrets: list[Any]) -> Non
         ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, [], "JWT_SECRET_KEY_FILE"),
         ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, ["other"], "JWT_SECRET_KEY_FILE"),
         ({"JWT_SECRET_KEY_FILE": "/run/secrets/.."}, [".."], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, [{"source": "jwt", "target": "/etc/jwt"}], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/a/b"}, [{"source": "x", "target": "/run/secrets/a/b"}], "JWT_SECRET_KEY_FILE"),
         ({"JWT_SECRET_KEY_FILE": "/run/secrets/$X"}, ["$X"], "JWT_SECRET_KEY_FILE"),
         ({"JWT_SECRET_KEY_FILE": "/run/secrets/None"}, [{}], "JWT_SECRET_KEY_FILE"),
         ({"ACCESS_TOKEN_TTL": ""}, [], "ACCESS_TOKEN_TTL"),
