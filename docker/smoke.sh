@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Smoke-tests the docker/server stack and every agent directory in
 # DERHOST_SMOKE_AGENT_DIRS end to end (#68, #95): config, build, up, health
-# wait, identity check, restart of one agent, down, teardown count. Every
-# project here is a derhost-smoke project with its own compose overlay, so a
+# wait, identity check, job probes, restart of one agent, down, teardown count.
+# Every project here is a derhost-smoke project with its own compose overlay, so a
 # run never names or removes a developer's `stack-up` objects. Run it as
 # `make stack-smoke`, which passes AGENT_DIRS in. The author runs this
 # locally and pastes its output into the PR body, since CI does not build or
@@ -343,10 +343,23 @@ step_build_and_start_agent() {
     agent_compose_run "$dir" "$STEP_TIMEOUT" up -d --no-build --wait --wait-timeout "$WAIT_TIMEOUT"
 }
 
-# Issue 96's job probes run here, once both agents are connected and before
-# the restart. Nothing runs yet.
+# One job probe per listed agent, once every identity is connected and before
+# the restart. A directory without a probe file fails: an agent that is
+# connected but never asked to do anything is not smoke-tested. The probe's
+# identity must be the one the Dockerfile registers, so the file cannot drift.
 step_job_probes() {
-    log "job probes: none yet (issue 96)"
+    local dir probe identity
+    for dir in "${AGENTS[@]+"${AGENTS[@]}"}"; do
+        probe="$SCRIPT_DIR/$dir/smoke-probe.json"
+        [ -f "$probe" ] || die "docker/$dir/smoke-probe.json is missing"
+        identity="$(agent_identity "$dir")"
+        log "probe $dir"
+        # Through `run`, like every other step, so a signal ends it at once.
+        # The interpreter prints its own result line ("probe ok:" on stdout,
+        # "probe failed:" on stderr).
+        run timeout -k "$KILL_GRACE" "$STEP_TIMEOUT" python3 "$SCRIPT_DIR/lib/smoke_probe.py" "$probe" "$BASE_URL" \
+            --identity "$identity" || die "job probe failed for $dir"
+    done
 }
 
 step_restart() {
