@@ -475,7 +475,7 @@ def test_a_failing_probe_fails_the_run_prints_the_error_and_tears_down(
     connections.rpc_replies[identity] = {"success": False, "error": "boom from the agent"}
     result = _make_smoke(smoke_tree, stub_env)
     assert result.returncode != 0
-    assert f"job probe failed for {failing}" in result.stderr, result.stderr
+    assert f"job probe failed for {failing} (exit status 1)" in result.stderr, result.stderr
     assert (
         f"probe failed: {identity}.{_probe_file(smoke_tree, failing)['method']} failed: boom from the agent"
         in result.stderr
@@ -500,7 +500,7 @@ def test_a_probe_that_misses_its_expect_fails_the_run(
 
 
 @pytest.mark.parametrize("missing", AGENTS)
-def test_a_listed_dir_without_a_probe_file_fails_naming_the_directory(
+def test_a_listed_dir_without_a_probe_file_is_refused_before_any_docker_call(
     missing: str, smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
 ) -> None:
     (smoke_tree / "docker" / missing / "smoke-probe.json").unlink()
@@ -508,8 +508,10 @@ def test_a_listed_dir_without_a_probe_file_fails_naming_the_directory(
     assert result.returncode != 0
     assert f"docker/{missing}/smoke-probe.json is missing" in result.stderr, result.stderr
     assert "smoke passed" not in result.stdout
-    assert len(_down_indexes(_log_calls(stub_env))) == len(AGENTS) + 1
-    assert not [c for c in _log_calls(stub_env) if c[0] in ("stop", "start")]
+    # Checked with the rest of the agent directory's files: nothing was built,
+    # started or torn down, because nothing had been created yet.
+    assert _log_calls(stub_env) == []
+    assert "teardown" not in result.stdout
 
 
 def test_a_probe_whose_identity_differs_from_the_dockerfiles_fails(
@@ -749,6 +751,68 @@ def test_a_signal_during_an_agent_build_is_acted_on_at_once_and_tears_down(
     assert {_flag_value(c, "-p") for c in _compose_calls(calls, "up")} == {"derhost-smoke"}, calls
     assert _down_projects(calls) == ALL_SMOKE_PROJECTS, calls
     assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+
+
+# --- the job probe step: a signal ends it at once, a stuck probe is killed (#96). ---
+
+# A probe that outlasts every bound here. When STUB_SIGNAL_PROBE names a signal
+# it first signals the running smoke.sh, as the build stubs do.
+_STUB_PROBE = """import os
+import signal
+import time
+
+name = os.environ.get("STUB_SIGNAL_PROBE")
+if name:
+    with open(os.environ["STUB_SMOKE_PIDFILE"]) as pidfile:
+        os.kill(int(pidfile.read()), getattr(signal, "SIG" + name))
+time.sleep(40)
+"""
+
+
+def _use_stub_probe(tree: Path) -> None:
+    (tree / "docker" / "lib" / "smoke_probe.py").write_text(_STUB_PROBE, encoding="utf-8")
+
+
+def _assert_probe_step_ended_with_teardown(result: subprocess.CompletedProcess[str], env: dict[str, str]) -> None:
+    assert "smoke passed" not in result.stdout
+    calls = _log_calls(env)
+    # The restart comes after the probes, so it never started.
+    assert not [c for c in calls if c[0] in ("stop", "start")], calls
+    assert _down_projects(calls) == ALL_SMOKE_PROJECTS, calls
+    assert "teardown: 0 smoke objects remain" in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize(("signal_name", "status"), [("INT", 130), ("TERM", 143)])
+def test_a_signal_during_the_job_probe_is_acted_on_at_once_and_tears_down(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer, signal_name: str, status: int
+) -> None:
+    # The stub probe sleeps 40 s after signalling: a probe run in the
+    # foreground, where the trap waits for it, fails the 15 s bound.
+    _use_stub_probe(smoke_tree)
+    stub_env["STUB_SIGNAL_PROBE"] = signal_name
+    started = time.monotonic()
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    elapsed = time.monotonic() - started
+    assert result.returncode == status, result.stdout + result.stderr
+    assert elapsed < 15, elapsed
+    assert f"caught {signal_name}, stopping" in result.stdout, result.stdout
+    _assert_probe_step_ended_with_teardown(result, stub_env)
+
+
+def test_a_job_probe_that_outlasts_the_step_timeout_is_killed_and_its_status_reported(
+    smoke_tree: Path, stub_env: dict[str, str], connections: _ConnectionsServer
+) -> None:
+    # Without the timeout wrapper the 40 s stub runs to its end and fails the bound.
+    _use_stub_probe(smoke_tree)
+    stub_env["DERHOST_SMOKE_STEP_TIMEOUT"] = "4"
+    started = time.monotonic()
+    result = _smoke_sh(smoke_tree, stub_env, " ".join(AGENTS))
+    elapsed = time.monotonic() - started
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert elapsed < 20, elapsed
+    # 124 is what `timeout` returns for a step it ended.
+    assert f"job probe failed for {AGENTS[0]} (exit status 124)" in result.stderr, result.stderr
+    _assert_probe_step_ended_with_teardown(result, stub_env)
 
 
 # --- a second signal during teardown (#95). ---------------------------------

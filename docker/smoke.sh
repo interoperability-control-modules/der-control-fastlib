@@ -127,7 +127,7 @@ validate_agent_dirs() {
         fi
         seen="$seen$dir "
         local file
-        for file in docker-compose.yml compose.smoke.yml build.sh Dockerfile; do
+        for file in docker-compose.yml compose.smoke.yml build.sh Dockerfile smoke-probe.json; do
             [ -f "$SCRIPT_DIR/$dir/$file" ] || die "docker/$dir/$file is missing"
         done
         AGENTS+=("$dir")
@@ -344,21 +344,24 @@ step_build_and_start_agent() {
 }
 
 # One job probe per listed agent, once every identity is connected and before
-# the restart. A directory without a probe file fails: an agent that is
-# connected but never asked to do anything is not smoke-tested. The probe's
-# identity must be the one the Dockerfile registers, so the file cannot drift.
+# the restart. validate_agent_dirs has already refused a directory without a
+# probe file: an agent that is connected but never asked to do anything is not
+# smoke-tested. The probe's identity must be the one the Dockerfile registers,
+# so the file cannot drift.
 step_job_probes() {
-    local dir probe identity
+    local dir probe identity rc
     for dir in "${AGENTS[@]+"${AGENTS[@]}"}"; do
         probe="$SCRIPT_DIR/$dir/smoke-probe.json"
-        [ -f "$probe" ] || die "docker/$dir/smoke-probe.json is missing"
         identity="$(agent_identity "$dir")"
         log "probe $dir"
         # Through `run`, like every other step, so a signal ends it at once.
         # The interpreter prints its own result line ("probe ok:" on stdout,
-        # "probe failed:" on stderr).
+        # "probe failed:" on stderr); the status here tells a probe that
+        # failed (1) from one `timeout` ended (124).
+        rc=0
         run timeout -k "$KILL_GRACE" "$STEP_TIMEOUT" python3 "$SCRIPT_DIR/lib/smoke_probe.py" "$probe" "$BASE_URL" \
-            --identity "$identity" || die "job probe failed for $dir"
+            --identity "$identity" || rc=$?
+        [ "$rc" -eq 0 ] || die "job probe failed for $dir (exit status $rc)"
     done
 }
 
