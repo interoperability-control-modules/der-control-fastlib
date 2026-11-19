@@ -11,6 +11,8 @@ file gets the same checks with no extra wiring.
 
 from __future__ import annotations
 
+import posixpath
+import re
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,37 @@ HEALTH_PATH = "/health"
 def discover_compose_files() -> list[Path]:
     """Every docker/<name>/docker-compose.yml under the repo root."""
     return sorted(DOCKER_DIR.glob("*/docker-compose.yml"))
+
+
+# Docker Compose reads compose.yaml, compose.yml, docker-compose.yaml,
+# docker-compose.yml and an override sitting beside any of them, and `-f` can
+# name any other file. Only the two names the rules below load are accepted;
+# a compose-shaped file under any other name would be read by Docker and
+# checked by nothing.
+_ACCEPTED_COMPOSE_NAMES = ("docker-compose.yml", "compose.smoke.yml")
+
+
+def _is_compose_shaped(name: str) -> bool:
+    lowered = name.lower()
+    if not lowered.endswith((".yml", ".yaml")):
+        return False
+    return "compose" in lowered or ".override." in lowered
+
+
+def check_compose_file_names(root: Path) -> list[Path]:
+    """Return the accepted compose files under root; refuse any other compose-shaped name."""
+    accepted: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or not _is_compose_shaped(path.name):
+            continue
+        if path.parent.parent == root and path.name in _ACCEPTED_COMPOSE_NAMES:
+            accepted.append(path)
+        else:
+            raise AssertionError(
+                f"{path}: compose file name not accepted; only docker/<name>/"
+                f"{' and docker/<name>/'.join(_ACCEPTED_COMPOSE_NAMES)} are checked"
+            )
+    return accepted
 
 
 class _ComposeLoader(yaml.SafeLoader):
@@ -105,11 +138,11 @@ def test_server_internal_bind_is_all_interfaces() -> None:
     assert '"--host", "0.0.0.0", "--port", "8000"' in dockerfile, dockerfile
 
 
-# --- Rule 2: no Docker socket mount, and no /var/run or /run mount. ---------
+# --- Rule 2: no Docker socket, and every mount source is a named volume or tmpfs. ---
 
 
 def check_no_docker_socket(name: str, service: dict[str, Any]) -> None:
-    for volume in service.get("volumes", []):
+    for volume in service.get("volumes") or []:
         if "docker.sock" in str(volume):
             raise AssertionError(f"{name}: mounts the Docker socket: {volume!r}")
 
@@ -119,28 +152,185 @@ def test_no_docker_socket_mount() -> None:
         check_no_docker_socket(name, service)
 
 
+# A compose volume name. Anything else in the source slot (a path, `.`, `~`,
+# `$`) is a host path or an interpolation that could become one.
+_VOLUME_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*")
+
+
+def _is_volume_name(source: Any) -> bool:
+    return _VOLUME_NAME.fullmatch(str(source)) is not None
+
+
+def check_named_volumes_only(name: str, service: dict[str, Any]) -> None:
+    if service.get("volumes_from"):
+        raise AssertionError(f"{name}: volumes_from inherits another service's mounts: {service['volumes_from']!r}")
+    for volume in service.get("volumes") or []:
+        if isinstance(volume, dict):
+            allowed = volume.get("type") == "tmpfs" or (
+                volume.get("type") == "volume" and _is_volume_name(volume.get("source") or "")
+            )
+        else:
+            allowed = _is_volume_name(str(volume).split(":", 1)[0])
+        if not allowed:
+            raise AssertionError(f"{name}: mount source is not a named volume or tmpfs: {volume!r}")
+
+
+def check_top_level_sources(path: Path, compose: dict[str, Any]) -> None:
+    for section in ("secrets", "configs"):
+        for key, entry in (compose.get(section) or {}).items():
+            source = entry.get("file") if isinstance(entry, dict) else None
+            if source is None:
+                continue
+            normalized = posixpath.normpath(str(source))
+            if (
+                "$" in str(source)
+                or str(source).startswith("~")
+                or posixpath.isabs(normalized)
+                or (normalized == ".." or normalized.startswith("../"))
+            ):
+                raise AssertionError(
+                    f"{path}: {section} {key}: file {source!r} must be a plain relative path inside the project"
+                )
+    for key, entry in (compose.get("volumes") or {}).items():
+        if isinstance(entry, dict) and entry.get("driver_opts"):
+            raise AssertionError(f"{path}: volume {key} sets driver_opts, which can bind a host path: {entry!r}")
+
+
+def test_mount_sources_are_named_volumes_or_tmpfs() -> None:
+    for _, name, service in _all_services():
+        check_named_volumes_only(name, service)
+
+
 def test_no_docker_socket_mount_fixture_fails() -> None:
     with pytest.raises(AssertionError, match="Docker socket"):
         check_no_docker_socket(SERVER_SERVICE, {"volumes": ["/var/run/docker.sock:/var/run/docker.sock:ro"]})
 
 
-def check_no_var_run_mount(name: str, service: dict[str, Any]) -> None:
-    for volume in service.get("volumes", []):
-        host_path = str(volume).split(":", 1)[0]
-        if host_path in ("/var/run", "/run") or host_path.startswith(("/var/run/", "/run/")):
-            raise AssertionError(f"{name}: mounts a host runtime directory: {volume!r}")
+@pytest.mark.parametrize(
+    "volume",
+    [
+        {"type": "bind", "source": "/var/run/docker.sock", "target": "/x"},
+        "/var/./run/docker.sock:/s",
+        "/run/../var/run/docker.sock:/s:ro",
+        "/srv/docker.sock:/s",
+    ],
+)
+def test_docker_socket_mounts_fail_in_both_volume_forms(volume: Any) -> None:
+    with pytest.raises(AssertionError, match="Docker socket") as excinfo:
+        check_no_docker_socket(SERVER_SERVICE, {"volumes": [volume]})
+    assert repr(volume) in str(excinfo.value)
 
 
-def test_no_var_run_mount() -> None:
-    for _, name, service in _all_services():
-        check_no_var_run_mount(name, service)
+# Every mount source must be a compose volume name or a tmpfs. A path, a
+# relative path, `~` or an interpolation is refused without the rule having to
+# know what it resolves to, so a host path cannot slip past a deny-list.
+_REFUSED_MOUNTS = [
+    "/var/run:/var/run",
+    {"type": "bind", "source": "/var/run", "target": "/x"},
+    {"type": "bind", "source": "/run", "target": "/x"},
+    {"type": "bind", "source": "/", "target": "/x"},
+    "/:/host",
+    "/var:/v:ro",
+    "/var/run/../run:/r",
+    "//var/run:/r",
+    "/var/./run/sub:/r",
+    "/run/containerd/containerd.sock:/x",
+    "/proc/1/root:/h",
+    "/proc/1/root/run:/h",
+    "/etc:/e",
+    "/sys:/s",
+    "/dev:/d",
+    "/root:/h",
+    "~root:/x",
+    "./data:/data:ro",
+    "/var/lib/derhost:/data",
+    "../../../../../../../../../../var/run:/a",
+    "${D:-/var/run}:/a",
+    "$D:/a",
+    {"type": "bind", "source": "/etc", "target": "/e"},
+    {"type": "volume", "source": "/etc", "target": "/e"},
+    {"type": "volume", "target": "/e"},
+    {"type": "bind", "source": "derhost-home", "target": "/e"},
+    {"type": "image", "source": "derhost-server:local", "target": "/e"},
+]
 
 
-def test_no_var_run_mount_fixture_fails() -> None:
-    # /var/run is the Docker socket's parent directory: mounting it reaches
-    # the socket without naming it.
-    with pytest.raises(AssertionError, match="host runtime directory"):
-        check_no_var_run_mount(SERVER_SERVICE, {"volumes": ["/var/run:/var/run"]})
+@pytest.mark.parametrize("volume", _REFUSED_MOUNTS)
+def test_a_mount_source_that_is_not_a_named_volume_or_tmpfs_fails(volume: Any) -> None:
+    with pytest.raises(AssertionError, match="not a named volume") as excinfo:
+        check_named_volumes_only(SERVER_SERVICE, {"volumes": [volume]})
+    assert repr(volume) in str(excinfo.value)
+
+
+def test_volumes_from_is_refused_because_it_inherits_another_services_mounts() -> None:
+    with pytest.raises(AssertionError, match="volumes_from") as excinfo:
+        check_named_volumes_only(SERVER_SERVICE, {"volumes_from": ["other"]})
+    assert "other" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        "derhost-home:/var/volttron",
+        {"type": "volume", "source": "derhost-home", "target": "/var/volttron"},
+        {"type": "tmpfs", "target": "/tmp"},
+    ],
+)
+def test_ordinary_mounts_pass_the_mount_rules(volume: Any) -> None:
+    # Control: the refusals above come from the source, not from a blanket
+    # refusal of volumes.
+    service = {"volumes": [volume], "volumes_from": []}
+    check_named_volumes_only(SERVER_SERVICE, service)
+    check_no_docker_socket(SERVER_SERVICE, service)
+
+
+# --- Rule 2b: top-level secrets, configs and volumes name no host path. -----
+
+
+@pytest.mark.parametrize(
+    ("compose", "key", "needle"),
+    [
+        ({"secrets": {"s": {"file": "/var/run/docker.sock"}}}, "s", "/var/run/docker.sock"),
+        ({"configs": {"c": {"file": "/etc/passwd"}}}, "c", "/etc/passwd"),
+        ({"secrets": {"s": {"file": "../../x"}}}, "s", "../../x"),
+        ({"secrets": {"s": {"file": "./a/../../x"}}}, "s", "./a/../../x"),
+        ({"secrets": {"s": {"file": ".."}}}, "s", ".."),
+        ({"secrets": {"s": {"file": "${P}"}}}, "s", "${P}"),
+        ({"secrets": {"s": {"file": "./${P}/x"}}}, "s", "./${P}/x"),
+        ({"configs": {"c": {"file": "~root/c"}}}, "c", "~root/c"),
+        ({"volumes": {"v": {"driver_opts": {"type": "none", "o": "bind", "device": "/var/run"}}}}, "v", "driver_opts"),
+    ],
+)
+def test_top_level_sources_that_reach_the_host_fail(compose: dict[str, Any], key: str, needle: str) -> None:
+    path = DOCKER_DIR / "some-agent" / "docker-compose.yml"
+    with pytest.raises(AssertionError) as excinfo:
+        check_top_level_sources(path, compose)
+    message = str(excinfo.value)
+    assert key in message and needle in message and str(path) in message
+
+
+@pytest.mark.parametrize(
+    "compose",
+    [
+        {"secrets": {"jwt": {"file": "./secrets/jwt"}}},
+        {"secrets": {"jwt": {"file": "secrets/../secrets/jwt"}}},
+        {"secrets": {"jwt": {"environment": "JWT"}}},
+        {"configs": {"c": {"content": "x"}}},
+        {"volumes": {"derhost-home": {"driver": "local"}}},
+        {"volumes": {"derhost-home": None}},
+        {},
+    ],
+)
+def test_top_level_sources_inside_the_project_pass(compose: dict[str, Any]) -> None:
+    # Control: the refusals above come from the file or driver_opts value.
+    check_top_level_sources(DOCKER_DIR / "some-agent" / "docker-compose.yml", compose)
+
+
+def test_top_level_sources_of_every_real_compose_file_pass() -> None:
+    paths = [*discover_compose_files(), *discover_overlay_files()]
+    assert len(paths) == 6, paths
+    for path in paths:
+        check_top_level_sources(path, load_compose(path))
 
 
 # --- Rule 3: non-root user 1000, every service. ------------------------------
@@ -218,11 +408,35 @@ def test_not_privileged_fixture_fails() -> None:
 # --- Rule 4d: no host network or PID namespace, every service. --------------
 
 
+_UNCONFINED_SECURITY_OPTS = tuple(
+    f"{kind}{sep}{value}"
+    for kind, value in (
+        ("seccomp", "unconfined"),
+        ("apparmor", "unconfined"),
+        ("label", "disable"),
+        ("systempaths", "unconfined"),
+    )
+    for sep in ("=", ":")
+)
+
+
 def check_no_host_namespace(name: str, service: dict[str, Any]) -> None:
     if service.get("network_mode") == "host":
         raise AssertionError(f"{name}: network_mode: host must not be set")
     if service.get("pid") == "host":
         raise AssertionError(f"{name}: pid: host must not be set")
+    for key in ("ipc", "userns_mode", "uts", "cgroup"):
+        if service.get(key) == "host":
+            raise AssertionError(f"{name}: {key}: host must not be set")
+    for key in ("network_mode", "pid", "ipc"):
+        if str(service.get(key) or "").startswith(("container:", "service:")):
+            raise AssertionError(f"{name}: {key}: {service[key]} joins another container's namespace")
+    for option in service.get("security_opt") or []:
+        if str(option).strip().lower() in _UNCONFINED_SECURITY_OPTS:
+            raise AssertionError(f"{name}: security_opt {option} disables a confinement profile")
+    for key in ("devices", "device_cgroup_rules"):
+        if service.get(key):
+            raise AssertionError(f"{name}: {key} must not be set, got {service[key]!r}")
 
 
 def test_no_host_namespace() -> None:
@@ -238,6 +452,48 @@ def test_no_host_namespace_fixture_fails_network() -> None:
 def test_no_host_namespace_fixture_fails_pid() -> None:
     with pytest.raises(AssertionError, match="pid"):
         check_no_host_namespace(SERVER_SERVICE, {"pid": "host"})
+
+
+@pytest.mark.parametrize(
+    ("service", "needle"),
+    [
+        ({"security_opt": ["seccomp=unconfined"]}, "seccomp=unconfined"),
+        ({"security_opt": ["seccomp:unconfined"]}, "seccomp:unconfined"),
+        ({"security_opt": ["apparmor=unconfined"]}, "apparmor=unconfined"),
+        ({"security_opt": ["apparmor:unconfined"]}, "apparmor:unconfined"),
+        ({"security_opt": ["label=disable"]}, "label=disable"),
+        ({"security_opt": ["label:disable"]}, "label:disable"),
+        ({"security_opt": [" Seccomp=Unconfined "]}, "Seccomp=Unconfined"),
+        ({"security_opt": ["no-new-privileges:true", "systempaths=unconfined"]}, "systempaths=unconfined"),
+        ({"ipc": "host"}, "ipc"),
+        ({"userns_mode": "host"}, "userns_mode"),
+        ({"uts": "host"}, "uts"),
+        ({"cgroup": "host"}, "cgroup"),
+        ({"network_mode": "container:other"}, "network_mode"),
+        ({"network_mode": "service:other"}, "network_mode"),
+        ({"pid": "container:other"}, "pid"),
+        ({"pid": "service:other"}, "pid"),
+        ({"ipc": "service:other"}, "ipc"),
+        ({"devices": ["/dev/mem:/dev/mem"]}, "devices"),
+        ({"device_cgroup_rules": ["c 1:3 mr"]}, "device_cgroup_rules"),
+    ],
+)
+def test_no_host_namespace_fixture_fails_every_confinement_escape(service: dict[str, Any], needle: str) -> None:
+    with pytest.raises(AssertionError, match=needle):
+        check_no_host_namespace(SERVER_SERVICE, service)
+
+
+def test_no_host_namespace_fixture_passes_a_confined_service() -> None:
+    # Control: the parametrized refusals above are not a blanket refusal.
+    check_no_host_namespace(
+        SERVER_SERVICE,
+        {
+            "security_opt": ["no-new-privileges:true"],
+            "network_mode": "bridge",
+            "ipc": "private",
+            "devices": [],
+        },
+    )
 
 
 # --- Rule 4e: no env_file, every service. ------------------------------------
@@ -415,10 +671,46 @@ def _looks_like_secret_key(key: str) -> bool:
     return any(marker in upper for marker in _SECRET_KEY_MARKERS)
 
 
+_SECRETS_DIR = "/run/secrets/"
+_NUMERIC_SUFFIXES = ("MINUTES", "SECONDS", "HOURS", "DAYS", "TTL", "COUNT", "LENGTH")
+_BOOLEAN_SUFFIXES = ("ENABLED", "REQUIRED")
+
+
+def _declared_secret_names(service: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for entry in service.get("secrets") or []:
+        declared = (entry.get("target") or entry.get("source")) if isinstance(entry, dict) else entry
+        if declared:
+            names.add(str(declared))
+    return names
+
+
+def _is_declared_secret_file(key: str, value: str, service: dict[str, Any]) -> bool:
+    if not key.upper().endswith("_FILE") or "$" in value or posixpath.normpath(value) != value:
+        return False
+    if not value.startswith(_SECRETS_DIR):
+        return False
+    secret = value[len(_SECRETS_DIR) :]
+    return bool(secret) and "/" not in secret and secret in _declared_secret_names(service)
+
+
+def _is_config_shaped(key: str, value: str) -> bool:
+    suffix = key.upper().rsplit("_", 1)[-1]
+    if suffix in _NUMERIC_SUFFIXES:
+        # Six digits cover a real TTL or count; a longer run is a secret in disguise.
+        return re.fullmatch(r"[0-9]{1,6}", value) is not None
+    if suffix in _BOOLEAN_SUFFIXES:
+        return value.lower() in ("true", "false", "0", "1")
+    return False
+
+
 def check_no_secret_env(name: str, service: dict[str, Any]) -> None:
-    for key in _env_mapping(service):
-        if _looks_like_secret_key(key):
-            raise AssertionError(f"{name}: {key} must not be a literal environment value")
+    for key, value in _env_mapping(service).items():
+        if not _looks_like_secret_key(key):
+            continue
+        if _is_declared_secret_file(key, value, service) or _is_config_shaped(key, value):
+            continue
+        raise AssertionError(f"{name}: {key} must not be a literal environment value")
 
 
 def test_no_secret_env() -> None:
@@ -441,6 +733,111 @@ def test_no_secret_env_fixture_fails_password() -> None:
     # A differently named secret must be caught too, not only JWT_SECRET_KEY.
     with pytest.raises(AssertionError, match="DB_PASSWORD"):
         check_no_secret_env(SERVER_SERVICE, {"environment": {"DB_PASSWORD": "not-a-real-secret"}})
+
+
+@pytest.mark.parametrize(
+    ("environment", "secrets"),
+    [
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt_secret_key"}, ["jwt_secret_key"]),
+        (["JWT_SECRET_KEY_FILE=/run/secrets/jwt_secret_key"], ["jwt_secret_key"]),
+        ({"DB_PASSWORD_FILE": "/run/secrets/db_password"}, [{"source": "db", "target": "db_password"}]),
+        ({"DB_PASSWORD_FILE": "/run/secrets/db"}, [{"source": "db"}]),
+        ({"ACCESS_TOKEN_EXPIRE_MINUTES": "30"}, []),
+        (["ACCESS_TOKEN_EXPIRE_MINUTES=30"], []),
+        ({"ACCESS_TOKEN_EXPIRE_MINUTES": 30}, []),
+        ({"TOKEN_CACHE_ENABLED": "true"}, []),
+        ({"TOKEN_CACHE_ENABLED": True}, []),
+        ({"TOKEN_CACHE_REQUIRED": "false"}, []),
+        ({"SESSION_TOKEN_SECONDS": "60"}, []),
+        ({"SESSION_TOKEN_HOURS": "8"}, []),
+        ({"SESSION_TOKEN_DAYS": "7"}, []),
+        ({"ACCESS_TOKEN_TTL": "123456"}, []),
+        ({"RETRY_TOKEN_COUNT": "3"}, []),
+        ({"ADMIN_PASSWORD_LENGTH": "32"}, []),
+        ({"VOLTTRON_HOME": "/var/volttron"}, []),
+    ],
+)
+def test_secret_env_allowances_pass(environment: Any, secrets: list[Any]) -> None:
+    check_no_secret_env(SERVER_SERVICE, {"environment": environment, "secrets": secrets})
+
+
+@pytest.mark.parametrize(
+    ("environment", "secrets", "key"),
+    [
+        ({"JWT_SECRET_KEY": "not-a-real-secret"}, ["jwt_secret_key"], "JWT_SECRET_KEY"),
+        ({"JWT_SECRET_KEY_FILE": "/etc/jwt"}, ["jwt"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/../etc/shadow"}, ["shadow"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/"}, [""], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/a/b"}, ["a/b"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "${JWT_PATH}"}, ["jwt"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, [], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/jwt"}, ["other"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/.."}, [".."], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/$X"}, ["$X"], "JWT_SECRET_KEY_FILE"),
+        ({"JWT_SECRET_KEY_FILE": "/run/secrets/None"}, [{}], "JWT_SECRET_KEY_FILE"),
+        ({"ACCESS_TOKEN_TTL": ""}, [], "ACCESS_TOKEN_TTL"),
+        ({"ACCESS_TOKEN_TTL": "1234567"}, [], "ACCESS_TOKEN_TTL"),
+        ({"ACCESS_TOKEN_TTL": "9" * 40}, [], "ACCESS_TOKEN_TTL"),
+        ({"ADMIN_PASSWORD_LENGTH": "73914562"}, [], "ADMIN_PASSWORD_LENGTH"),
+        ({"ACCESS_TOKEN_EXPIRE_MINUTES": "abcdef"}, [], "ACCESS_TOKEN_EXPIRE_MINUTES"),
+        ({"ACCESS_TOKEN_EXPIRE_MINUTES": "${MINUTES}"}, [], "ACCESS_TOKEN_EXPIRE_MINUTES"),
+        ({"TOKEN_CACHE_ENABLED": "maybe"}, [], "TOKEN_CACHE_ENABLED"),
+        ({"SECRET_FILE_PATH": "/run/secrets/x"}, ["x"], "SECRET_FILE_PATH"),
+        ({"DB_PASSWORD": "${DB_PASSWORD}"}, [], "DB_PASSWORD"),
+        (["DB_PASSWORD"], [], "DB_PASSWORD"),
+    ],
+)
+def test_secret_env_violations_fail(environment: Any, secrets: list[Any], key: str) -> None:
+    # Control for the allowances: none of them opens the rule for a value that
+    # is not a declared secret file or a number or boolean.
+    with pytest.raises(AssertionError, match=key):
+        check_no_secret_env(SERVER_SERVICE, {"environment": environment, "secrets": secrets})
+
+
+# --- Rule 13: every compose file name Docker would read is checked (#75). ----
+
+
+def _touch(root: Path, *relative: str) -> None:
+    for entry in relative:
+        target = root / entry
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("services: {}\n", encoding="utf-8")
+
+
+def test_every_compose_file_name_under_docker_is_accepted() -> None:
+    accepted = check_compose_file_names(DOCKER_DIR)
+    assert sorted(p.name for p in accepted) == ["compose.smoke.yml"] * 3 + ["docker-compose.yml"] * 3, accepted
+    assert [p for p in accepted if p.name == "docker-compose.yml"] == discover_compose_files()
+    assert [p for p in accepted if p.name == "compose.smoke.yml"] == discover_overlay_files()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "x/compose.yaml",
+        "x/compose.yml",
+        "x/docker-compose.yaml",
+        "x/docker-compose.override.yml",
+        "x/docker-compose.override.yaml",
+        "x/prod.override.yml",
+        "x/Compose.YML",
+        "x/compose.prod.yml",
+        "x/deeper/docker-compose.yml",
+        "compose.yml",
+        "docker-compose.yml",
+    ],
+)
+def test_a_compose_file_under_another_name_or_place_is_refused(tmp_path: Path, relative: str) -> None:
+    _touch(tmp_path, "x/docker-compose.yml", "x/compose.smoke.yml", relative)
+    with pytest.raises(AssertionError, match="not accepted") as excinfo:
+        check_compose_file_names(tmp_path)
+    assert str(tmp_path / relative) in str(excinfo.value)
+
+
+def test_a_tree_of_accepted_names_passes_discovery(tmp_path: Path) -> None:
+    # Control: the refusals above come from the names, not from the fixture tree.
+    _touch(tmp_path, "x/docker-compose.yml", "x/compose.smoke.yml", "x/Dockerfile", "x/notes.yml")
+    assert [p.name for p in check_compose_file_names(tmp_path)] == ["compose.smoke.yml", "docker-compose.yml"]
 
 
 # --- Regression: the review's agent mutant (M11) must be rejected. ----------
@@ -484,7 +881,7 @@ SMOKE_NETWORK = "derhost-smoke-net"
 SERVER_OVERLAY_PORTS = ["${DERHOST_PUBLISH_HOST:-127.0.0.1}::8000"]
 _FORBIDDING_RULES = (
     check_no_docker_socket,
-    check_no_var_run_mount,
+    check_named_volumes_only,
     check_no_cap_add,
     check_not_privileged,
     check_no_host_namespace,
