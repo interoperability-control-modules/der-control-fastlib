@@ -13,11 +13,6 @@ main() {
   fi
   local checkout="$1"
 
-  if [ "${ALLOW_DIRTY:-0}" = "1" ]; then
-    echo "check-clean: ALLOW_DIRTY=1, skipping the dirty-checkout check for ${checkout}" >&2
-    exit 0
-  fi
-
   if [ ! -e "${checkout}" ]; then
     echo "check-clean: ${checkout} does not exist" >&2
     exit 1
@@ -26,6 +21,26 @@ main() {
   if ! git -C "${checkout}" rev-parse --git-dir >/dev/null 2>&1; then
     echo "check-clean: ${checkout} is not a git checkout" >&2
     exit 1
+  fi
+
+  # build-agent.sh archives HEAD of this path, and from a subdirectory that
+  # would silently archive only the subtree (#148).
+  local top abs
+  if ! top="$(git -C "${checkout}" rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "check-clean: ${checkout} is not the top of a git work tree" >&2
+    exit 1
+  fi
+  abs="$(cd "${checkout}" && pwd -P)"
+  top="$(cd "${top}" && pwd -P)"
+  if [ "${abs}" != "${top}" ]; then
+    echo "check-clean: ${checkout} is a subdirectory of the work tree at ${top}; pass the top of the checkout" >&2
+    exit 1
+  fi
+
+  # ALLOW_DIRTY bypasses only the dirtiness check, never the path checks above.
+  if [ "${ALLOW_DIRTY:-0}" = "1" ]; then
+    echo "check-clean: ALLOW_DIRTY=1, skipping the dirty-checkout check for ${checkout}" >&2
+    exit 0
   fi
 
   local status

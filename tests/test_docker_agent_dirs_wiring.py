@@ -22,6 +22,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STACK_PORT = 5410
+# The value docker.mk gives DER_AGENT_SRC where no build happens: absolute and
+# never a directory, so it cannot resolve to a real build context (#86, #148).
+NO_BUILD_PLACEHOLDER = "/dev/null/no-build"
 
 _OVERRIDE_KEYS = ("DERHOST_PUBLISH_HOST", "EXPECTED", "DERHOST_CHECK_BASE_URL", "C")
 _MAKE_RECURSION_KEYS = ("MAKELEVEL", "MAKEFLAGS", "MFLAGS")
@@ -255,6 +258,11 @@ def test_stack_down_default_stops_both_agents_before_the_server(docker_stub: Pat
     # Each call must have loaded: an agent compose file that cannot load makes
     # `down` fail, which the recipe's `|| true` hides, leaving the agent up.
     assert _load_results(docker_stub) == ["down rc=0"] * 3
+    agent_downs = [(name, src) for sub, name, src, _ in _agent_events(docker_stub.read_text()) if sub == "down"]
+    assert agent_downs == [
+        ("interoperability-service", NO_BUILD_PLACEHOLDER),
+        ("realtime-control-agent", NO_BUILD_PLACEHOLDER),
+    ], agent_downs
 
 
 def test_stack_status_default_covers_the_server_and_both_agents(docker_stub: Path) -> None:
@@ -268,6 +276,11 @@ def test_stack_status_default_covers_the_server_and_both_agents(docker_stub: Pat
         "docker/realtime-control-agent",
     ], dirs
     assert _load_results(docker_stub) == ["ps rc=0"] * 3
+    agent_ps = [(name, src) for sub, name, src, _ in _agent_events(docker_stub.read_text()) if sub == "ps"]
+    assert agent_ps == [
+        ("interoperability-service", NO_BUILD_PLACEHOLDER),
+        ("realtime-control-agent", NO_BUILD_PLACEHOLDER),
+    ], agent_ps
 
 
 def test_stack_up_all_default_builds_and_starts_the_server_then_both_agents(docker_stub: Path, tmp_path: Path) -> None:
@@ -295,9 +308,9 @@ def test_stack_up_all_default_builds_and_starts_the_server_then_both_agents(dock
     sibling_checkouts = {str(tree.parent / "interoperability-service"), str(tree.parent / "realtime-control-agent")}
     for sub, _, der_agent_src, call in events:
         if sub == "build":
-            assert der_agent_src != "/dev/null/no-build" and der_agent_src not in sibling_checkouts, der_agent_src
+            assert der_agent_src != NO_BUILD_PLACEHOLDER and der_agent_src not in sibling_checkouts, der_agent_src
         else:
-            assert der_agent_src == "/dev/null/no-build", der_agent_src
+            assert der_agent_src == NO_BUILD_PLACEHOLDER, der_agent_src
             assert "--no-build" in call and "--build" not in call, call
     assert set(_load_results(docker_stub)) == {"build rc=0", "up rc=0"}
 
