@@ -10,11 +10,11 @@
 # what it will actually publish on, so preflight agrees with compose by
 # construction instead of re-deriving compose's own .env/env precedence.
 
-DOCKER_DIR := docker
-SERVER_COMPOSE := $(DOCKER_DIR)/server/docker-compose.yml
-SERVER_PROJECT_DIR := $(DOCKER_DIR)/server
-# override: a command-line SERVER_PROJECT_NAME would reach recipes unquoted
-# and retarget the server project (#85).
+# override: a command-line value for any of these would reach recipes unquoted
+# and retarget the server project or its paths (#85, #143).
+override DOCKER_DIR := docker
+override SERVER_COMPOSE := $(DOCKER_DIR)/server/docker-compose.yml
+override SERVER_PROJECT_DIR := $(DOCKER_DIR)/server
 override SERVER_PROJECT_NAME := derhost-server
 DERHOST_STACK_PORT := 5410
 DERHOST_HEALTHY_WAIT_SECS := 60
@@ -76,24 +76,19 @@ pass-through = $(if $(filter-out undefined,$($(1)_ORIGIN)),$(1)=$(call shell-saf
 # archive included) first, then starts it with --no-build.
 AGENT_DIRS := interoperability-service realtime-control-agent
 
-# AGENT_DIRS may be set on the command line (`make stack-smoke AGENT_DIRS=...`)
-# and reaches recipes as `derhost-$$name` and `$(foreach ...)` text, so it is
-# validated here, at parse time, before the first line that expands it. The
-# check reads `$(value AGENT_DIRS)`, which returns the text without expanding
-# a `$(shell ...)` in it, and strips the allowed characters with nested
-# `$(subst)`, whose result Make never re-expands; anything left over is a
-# character that has no business in a directory name. `call` is avoided on
-# purpose: it re-expands an argument that contains `$`. An empty list passes;
-# stack-smoke has its own refusal for that. The same check refuses `server`
-# and `smoke` for every target, since they would collide with the server and
-# smoke projects. docker/smoke.sh keeps its own validation for runs without
-# make.
+# AGENT_DIRS may come from the command line and reaches recipes as text, so it
+# is validated at parse time from `$(value ...)`, which never expands a
+# `$(shell ...)` in it. Only a-z, 0-9, - and spaces are allowed; the leftover
+# test removes spaces alone, since `$(strip)` would hide a tab, CR or newline.
+# docker/smoke.sh keeps its own validation for runs without make.
+_AD_EMPTY :=
+_AD_SPACE := $(_AD_EMPTY) $(_AD_EMPTY)
 _AD_PASS1 := $(subst i,,$(subst h,,$(subst g,,$(subst f,,$(subst e,,$(subst d,,$(subst c,,$(subst b,,$(subst a,,$(value AGENT_DIRS))))))))))
 _AD_PASS2 := $(subst r,,$(subst q,,$(subst p,,$(subst o,,$(subst n,,$(subst m,,$(subst l,,$(subst k,,$(subst j,,$(_AD_PASS1))))))))))
 _AD_PASS3 := $(subst z,,$(subst y,,$(subst x,,$(subst w,,$(subst v,,$(subst u,,$(subst t,,$(subst s,,$(_AD_PASS2)))))))))
 _AD_LEFT := $(subst -,,$(subst 9,,$(subst 8,,$(subst 7,,$(subst 6,,$(subst 5,,$(subst 4,,$(subst 3,,$(subst 2,,$(subst 1,,$(subst 0,,$(_AD_PASS3))))))))))))
 _AD_WORDS := $(value AGENT_DIRS)
-$(if $(strip $(_AD_LEFT)),$(error AGENT_DIRS is invalid: only a-z 0-9 - and spaces are allowed))
+$(if $(filter-out xx,$(subst $(_AD_SPACE),,x$(_AD_LEFT)x)),$(error AGENT_DIRS is invalid: only a-z 0-9 - and spaces are allowed))
 $(if $(filter -%,$(_AD_WORDS)),$(error AGENT_DIRS is invalid: an entry starts with -))
 $(if $(filter server smoke,$(_AD_WORDS)),$(error AGENT_DIRS lists a reserved name: server and smoke collide with the server and smoke projects))
 $(if $(filter-out $(words $(sort $(_AD_WORDS))),$(words $(_AD_WORDS))),$(error AGENT_DIRS is invalid: an entry is repeated))
