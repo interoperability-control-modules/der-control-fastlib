@@ -74,9 +74,14 @@ def require_docker_compose(*, ci: bool) -> str:
     pytest.skip(problem)
 
 
+def resolve_docker_cli() -> str:
+    """`require_docker_compose` with CI read from the environment: a fail in CI, a skip elsewhere."""
+    return require_docker_compose(ci=os.environ.get("CI") == "true")
+
+
 @pytest.fixture(scope="module")
 def docker_cli() -> str:
-    return require_docker_compose(ci=os.environ.get("CI") == "true")
+    return resolve_docker_cli()
 
 
 def _config_argv(directory: Path, overlay: bool, env_file: Path | None) -> list[str]:
@@ -369,6 +374,47 @@ def test_a_missing_docker_or_compose_skips_outside_ci_and_fails_in_ci(
     assert outside_ci == "skipped" and needle in outside_message, (outside_ci, outside_message)
     in_ci, in_message = _outcome(ci=True)
     assert in_ci == "failed" and needle in in_message, (in_ci, in_message)
+
+
+def test_a_docker_that_cannot_be_executed_is_a_missing_compose(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The interpreter line names a program that does not exist, so running the
+    # stub raises OSError rather than exiting non-zero.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "docker"
+    stub.write_text("#!/nonexistent/interpreter\n", encoding="utf-8")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    outcome, message = _outcome(ci=False)
+    assert outcome == "skipped" and "compose plugin is required" in message, (outcome, message)
+
+
+def _helper_outcome() -> str:
+    """How `resolve_docker_cli` ends (a skip must not hide behind pytest.raises)."""
+    try:
+        resolve_docker_cli()
+    except pytest.skip.Exception:
+        return "skipped"
+    except pytest.fail.Exception:
+        return "failed"
+    return "returned"
+
+
+@pytest.mark.parametrize(("ci", "expected"), [("true", "failed"), ("false", "skipped"), ("", "skipped")])
+def test_the_fixture_helper_reads_ci_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ci: str, expected: str
+) -> None:
+    _fake_docker(tmp_path / "bin", None)
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    monkeypatch.setenv("CI", ci)
+    assert _helper_outcome() == expected
+
+
+def test_the_fixture_helper_skips_when_ci_is_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_docker(tmp_path / "bin", None)
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    monkeypatch.delenv("CI", raising=False)
+    assert _helper_outcome() == "skipped"
 
 
 def test_a_docker_whose_compose_runs_is_returned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
