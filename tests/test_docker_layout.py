@@ -1093,6 +1093,34 @@ def check_overlay_top_level_keys(path: Path, compose: dict[str, Any]) -> None:
                 )
 
 
+# An agent overlay may swap a base secret's source for an empty committed file,
+# so a smoke run never reads a developer's real key. The file is checked on
+# disk, symlinks refused, because the path text alone proves nothing.
+_OVERLAY_SECRET_DIR = "smoke"
+
+
+def check_overlay_secrets(path: Path, compose: dict[str, Any], is_server: bool) -> None:
+    secrets = compose.get("secrets")
+    if not secrets:
+        return
+    if is_server:
+        raise AssertionError(f"{path}: the server overlay may not set top-level secrets: {', '.join(secrets)}")
+    base_path = path.parent / "docker-compose.yml"
+    declared = set((load_compose(base_path).get("secrets") or {}) if base_path.is_file() else {})
+    smoke_dir = path.parent / _OVERLAY_SECRET_DIR
+    for name, entry in secrets.items():
+        if name not in declared:
+            raise AssertionError(f"{path}: secret {name} is not declared by the base file")
+        expected = f"./{_OVERLAY_SECRET_DIR}/{name}"
+        if not isinstance(entry, dict) or entry != {"file": expected}:
+            raise AssertionError(f"{path}: secret {name} must be exactly {{file: {expected}}}, got {entry!r}")
+        source = smoke_dir / name
+        if smoke_dir.is_symlink() or source.is_symlink() or not source.is_file():
+            raise AssertionError(f"{path}: secret {name} file {expected} must be a regular file in the tree")
+        if source.stat().st_size != 0:
+            raise AssertionError(f"{path}: secret {name} file {expected} must be empty")
+
+
 def discover_overlay_files() -> list[Path]:
     """Every docker/<name>/compose.smoke.yml under the repo root."""
     return sorted(DOCKER_DIR.glob("*/compose.smoke.yml"))
@@ -1120,7 +1148,8 @@ def check_overlay(path: Path, compose: dict[str, Any]) -> None:
             raise AssertionError(f"{name}: publishes a port; only {SERVER_SERVICE} may")
         allowed = _SERVER_OVERLAY_ALLOWED_KEYS if is_server else _OVERLAY_ALLOWED_KEYS
         check_overlay_sets_only_allowed_keys(name, service, allowed)
-    check_overlay_top_level_keys(path, compose)
+    check_overlay_secrets(path, compose, is_server)
+    check_overlay_top_level_keys(path, {k: v for k, v in compose.items() if k != "secrets"})
     if not is_server and compose.get("name") != f"derhost-smoke-{directory}":
         raise AssertionError(f"{path}: expected name: derhost-smoke-{directory}, got {compose.get('name')!r}")
     network = (compose.get("networks") or {}).get("derhost-net") or {}
@@ -1278,3 +1307,95 @@ def test_overlay_naming_fixtures_fail() -> None:
         check_overlay(path, local_tag)
     with pytest.raises(AssertionError, match="expected name"):
         check_overlay(path, {**good, "name": "derhost-realtime-control-agent"})
+
+
+_BASE_WITH_SECRET = (
+    "name: derhost-realtime-control-agent\n"
+    "services:\n  derhost-realtime-control-agent:\n    image: x\n"
+    "secrets:\n  api_key_marker:\n    file: ./secrets/api_key_marker\n"
+)
+
+
+def _secret_overlay(tmp_path: Path, secrets_block: str, *, content: bytes | None = b"") -> Path:
+    """An agent overlay beside a base file declaring `api_key_marker`, plus its smoke file."""
+    directory = tmp_path / "realtime-control-agent"
+    (directory / "smoke").mkdir(parents=True)
+    (directory / "docker-compose.yml").write_text(_BASE_WITH_SECRET, encoding="utf-8")
+    if content is not None:
+        (directory / "smoke" / "api_key_marker").write_bytes(content)
+    overlay = directory / "compose.smoke.yml"
+    text = _agent_overlay_text().rstrip("\n") + "\n\n" + secrets_block
+    overlay.write_text(text, encoding="utf-8")
+    return overlay
+
+
+_GOOD_SECRETS = "secrets:\n  api_key_marker:\n    file: ./smoke/api_key_marker\n"
+
+
+def test_an_agent_overlay_may_substitute_an_empty_committed_secret(tmp_path: Path) -> None:
+    overlay = _secret_overlay(tmp_path, _GOOD_SECRETS)
+    compose = load_compose(overlay)
+    assert compose["secrets"] == {"api_key_marker": {"file": "./smoke/api_key_marker"}}
+    check_overlay(overlay, compose)
+
+
+@pytest.mark.parametrize(
+    ("secrets_block", "needle"),
+    [
+        ("secrets:\n  api_key_marker:\n    file: /etc/api_key_marker\n", "api_key_marker"),
+        ("secrets:\n  api_key_marker:\n    file: ../smoke/api_key_marker\n", "api_key_marker"),
+        ("secrets:\n  api_key_marker:\n    file: ./other/api_key_marker\n", "api_key_marker"),
+        ("secrets:\n  api_key_marker:\n    file: ./smoke/another_name\n", "api_key_marker"),
+        ("secrets:\n  other_marker:\n    file: ./smoke/other_marker\n", "other_marker"),
+        ("secrets:\n  api_key_marker:\n    file: ./smoke/api_key_marker\n    external: true\n", "api_key_marker"),
+        ("secrets:\n  api_key_marker:\n    environment: HOME\n", "api_key_marker"),
+    ],
+)
+def test_an_overlay_secret_outside_the_narrow_form_fails_naming_the_secret(
+    tmp_path: Path, secrets_block: str, needle: str
+) -> None:
+    overlay = _secret_overlay(tmp_path, secrets_block)
+    with pytest.raises(AssertionError, match=needle):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_an_overlay_secret_whose_file_is_not_empty_fails(tmp_path: Path) -> None:
+    overlay = _secret_overlay(tmp_path, _GOOD_SECRETS, content=b"marker-not-a-real-key")
+    with pytest.raises(AssertionError, match="api_key_marker.*must be empty"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_an_overlay_secret_whose_file_is_missing_fails(tmp_path: Path) -> None:
+    overlay = _secret_overlay(tmp_path, _GOOD_SECRETS, content=None)
+    with pytest.raises(AssertionError, match="api_key_marker.*regular file"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_an_overlay_secret_whose_file_is_a_symlink_to_an_empty_file_fails(tmp_path: Path) -> None:
+    overlay = _secret_overlay(tmp_path, _GOOD_SECRETS, content=None)
+    (tmp_path / "empty").write_bytes(b"")
+    (overlay.parent / "smoke" / "api_key_marker").symlink_to(tmp_path / "empty")
+    with pytest.raises(AssertionError, match="api_key_marker.*regular file"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_an_overlay_secret_with_no_base_file_declaration_fails(tmp_path: Path) -> None:
+    overlay = _secret_overlay(tmp_path, _GOOD_SECRETS)
+    (overlay.parent / "docker-compose.yml").unlink()
+    with pytest.raises(AssertionError, match="api_key_marker.*not declared"):
+        check_overlay(overlay, load_compose(overlay))
+
+
+def test_a_server_overlay_with_top_level_secrets_fails(tmp_path: Path) -> None:
+    overlay = tmp_path / "server" / "compose.smoke.yml"
+    overlay.parent.mkdir()
+    (overlay.parent / "smoke").mkdir()
+    (overlay.parent / "smoke" / "api_key_marker").write_bytes(b"")
+    overlay.write_text(
+        (DOCKER_DIR / "server" / "compose.smoke.yml").read_text(encoding="utf-8").rstrip("\n")
+        + "\n\n"
+        + _GOOD_SECRETS,
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="server overlay.*api_key_marker"):
+        check_overlay(overlay, load_compose(overlay))
