@@ -6,6 +6,9 @@ and the lines on stdout and stderr are what is asserted.
 
 from __future__ import annotations
 
+import ast
+import base64
+import hashlib
 import http.server
 import importlib.util
 import json
@@ -13,6 +16,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -371,16 +375,6 @@ def test_a_missing_probe_file_fails_naming_it(tmp_path: Path, rpc_server: _RpcSe
     assert "cannot read probe file" in result.stderr and "absent.json" in result.stderr
 
 
-def test_topic_probes_are_refused_by_name_and_make_no_call(tmp_path: Path, rpc_server: _RpcServer) -> None:
-    # A topic probe reads WS /monitor/{id}; the standard library has no
-    # WebSocket client, and neither current agent publishes.
-    topic = {"identity": "demo.agent", "kind": "topic", "prefix": "demo/", "within_s": 5}
-    result = _probe(_write_probe(tmp_path, topic), rpc_server.url)
-    assert result.returncode == 1
-    assert result.stderr.strip() == "probe failed: topic probes are not supported yet"
-    assert rpc_server.requests == []
-
-
 def test_an_identity_other_than_the_expected_one_fails(tmp_path: Path, rpc_server: _RpcServer) -> None:
     probe_file = _write_probe(tmp_path, RPC_PROBE)
     assert _probe(probe_file, rpc_server.url, "--identity", "demo.agent").returncode == 0
@@ -551,3 +545,380 @@ def test_each_shipped_probe_passes_a_good_reply_and_fails_an_empty_one(agent: st
     empty = _probe(probe_file, rpc_server.url, "--identity", identity)
     assert empty.returncode == 1
     assert "below min_length 1" in empty.stderr
+
+
+# --- topic probes (#159): a bus monitor, an optional trigger, one exact publish. ---
+
+TOPIC = "devices/PNNL/grid_information/price/all"
+SENDER = "der.grid_signals"
+TOPIC_PROBE: dict[str, Any] = {
+    "identity": SENDER,
+    "kind": "topic",
+    "topic": TOPIC,
+    "within_s": 5,
+    "trigger": {"method": "publish_price_signal", "args": [], "expect": {"type": "int"}},
+    "select": [0, "tou"],
+    "expect": {"type": "float"},
+}
+PRICE_MESSAGE = [{"tou": 12.5}, {"tou": {"units": "cents", "tz": "PST", "type": "float"}}]
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _frame(payload: Any, opcode: int = 1, fin: bool = True, masked: bool = False) -> bytes:
+    """One server frame, unmasked as the bus sends it unless `masked` asks for the violation."""
+    data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    head = bytes([(0x80 if fin else 0) | opcode])
+    mask_bit = 0x80 if masked else 0
+    if len(data) < 126:
+        head += bytes([mask_bit | len(data)])
+    else:
+        head += bytes([mask_bit | 126]) + struct.pack("!H", len(data))
+    return head + (b"\0\0\0\0" if masked else b"") + data
+
+
+def _pub(topic: str = TOPIC, sender: str = SENDER, message: Any = PRICE_MESSAGE) -> bytes:
+    return _frame(
+        {
+            "type": "pubsub_message",
+            "timestamp": "t",
+            "topic": topic,
+            "sender": sender,
+            "headers": {},
+            "message": message,
+        }
+    )
+
+
+class _BusServer:
+    """Stands in for the server's RPC route and WS /monitor/{id}, recording what each saw."""
+
+    def __init__(self) -> None:
+        outer = self
+        self.events: list[tuple[str, Any]] = []
+        self.refuse = False
+        self.bad_accept = False
+        self.trigger_reply: Any = {"success": True, "result": 24}
+        self.on_connect: list[bytes] = []
+        self.on_trigger: list[bytes] = []
+        self.client_frames: list[tuple[int, bytes]] = []
+        self.handshakes: list[dict[str, str]] = []
+        self.monitor_done = threading.Event()
+        self._monitor_files: list[Any] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - http.server API
+                length = int(self.headers.get("Content-Length", "0"))
+                outer.events.append(("rpc", json.loads(self.rfile.read(length))))
+                body = json.dumps(outer.trigger_reply).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                for wfile in outer._monitor_files:
+                    for wire in outer.on_trigger:
+                        wfile.write(wire)
+                        wfile.flush()
+
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                outer.events.append(("monitor", self.path))
+                outer.handshakes.append({k.lower(): v for k, v in self.headers.items()})
+                if outer.refuse:
+                    body = b"monitor is already connected"
+                    self.send_response(409)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    outer.monitor_done.set()
+                    return
+                key = self.headers["Sec-WebSocket-Key"]
+                digest = hashlib.sha1((key + _WS_GUID).encode()).digest()  # noqa: S324 - RFC 6455
+                accept = base64.b64encode(b"x" * 20 if outer.bad_accept else digest).decode()
+                self.wfile.write(
+                    (
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                    ).encode()
+                )
+                outer._monitor_files.append(self.wfile)
+                for wire in outer.on_connect:
+                    self.wfile.write(wire)
+                self.wfile.flush()
+                try:
+                    while True:
+                        head = self.rfile.read(2)
+                        if len(head) < 2:
+                            break
+                        length = head[1] & 0x7F
+                        mask = self.rfile.read(4)
+                        data = bytes(b ^ mask[i % 4] for i, b in enumerate(self.rfile.read(length)))
+                        outer.client_frames.append((head[0] & 0x0F, data))
+                        if head[0] & 0x0F == 0x8:
+                            break
+                except OSError:
+                    pass
+                finally:
+                    # A later probe against this server must not write to a closed monitor.
+                    outer._monitor_files.remove(self.wfile)
+                    outer.monitor_done.set()
+
+            def log_message(self, *args: Any) -> None:
+                return
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    @property
+    def rpcs(self) -> list[Any]:
+        return [body for kind, body in self.events if kind == "rpc"]
+
+
+@pytest.fixture
+def bus() -> Iterator[_BusServer]:
+    server = _BusServer()
+    server.thread.start()
+    try:
+        yield server
+    finally:
+        server.server.shutdown()
+        server.thread.join(timeout=5)
+        server.server.server_close()
+
+
+def _topic_probe(tmp_path: Path, bus: _BusServer, probe: Any = TOPIC_PROBE) -> subprocess.CompletedProcess[str]:
+    return _probe(_write_probe(tmp_path, probe), bus.url, "--timeout", "10")
+
+
+def test_a_topic_probe_opens_the_monitor_then_triggers_then_passes_on_the_matching_frame(
+    tmp_path: Path, bus: _BusServer
+) -> None:
+    bus.on_trigger = [_pub()]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        f"probe ok: {SENDER} published {TOPIC} after publish_price_signal int value ok: float value ok"
+    )
+    assert [kind for kind, _ in bus.events] == ["monitor", "rpc"]
+    assert re.fullmatch(rf"/monitor/smoke-{re.escape(SENDER)}-\d+-[0-9a-f]{{8}}", bus.events[0][1]), bus.events[0]
+    assert bus.rpcs == [{"agent_id": SENDER, "method": "publish_price_signal", "args": [], "kwargs": {}}]
+    assert bus.handshakes[0]["upgrade"] == "websocket"
+    assert bus.handshakes[0]["sec-websocket-version"] == "13"
+    assert bus.monitor_done.wait(5)
+    assert bus.client_frames[-1][0] == 0x8
+
+
+def test_a_topic_probe_without_a_trigger_passes_on_a_publish_and_calls_no_rpc(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_connect = [_pub()]
+    probe = {k: v for k, v in TOPIC_PROBE.items() if k != "trigger"}
+    result = _topic_probe(tmp_path, bus, probe)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"probe ok: {SENDER} published {TOPIC}: float value ok"
+    assert bus.rpcs == []
+
+
+def test_each_monitor_id_is_unique_to_its_run(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_connect = [_pub()]
+    probe = {k: v for k, v in TOPIC_PROBE.items() if k != "trigger"}
+    for _ in range(2):
+        assert _topic_probe(tmp_path, bus, probe).returncode == 0
+    ids = [path for kind, path in bus.events if kind == "monitor"]
+    assert len(ids) == 2 and ids[0] != ids[1]
+
+
+def test_a_topic_with_no_publish_fails_at_within_s(tmp_path: Path, bus: _BusServer) -> None:
+    result = _topic_probe(tmp_path, bus, {**TOPIC_PROBE, "within_s": 0.5})
+    assert result.returncode == 1
+    assert result.stderr.strip() == f"probe failed: no frame on {TOPIC} from {SENDER} within 0.5s"
+
+
+def test_the_topic_from_another_sender_fails_naming_that_sender(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_pub(sender="impostor.agent")]
+    result = _topic_probe(tmp_path, bus, {**TOPIC_PROBE, "within_s": 0.5})
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        f"probe failed: no frame on {TOPIC} from {SENDER} within 0.5s (topic published by impostor.agent)"
+    )
+
+
+def test_other_topics_are_skipped_until_the_exact_one_arrives(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_pub(topic=TOPIC + "/extra"), _pub(topic="devices/PNNL/other"), _pub()]
+    assert _topic_probe(tmp_path, bus).returncode == 0
+
+
+def test_a_longer_topic_does_not_match_an_exact_topic(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_pub(topic=TOPIC + "/extra")]
+    result = _topic_probe(tmp_path, bus, {**TOPIC_PROBE, "within_s": 0.5})
+    assert result.returncode == 1
+    assert "no frame on" in result.stderr
+
+
+def test_the_first_matching_frame_decides_so_a_later_good_one_does_not_rescue_a_bad_one(
+    tmp_path: Path, bus: _BusServer
+) -> None:
+    bus.on_trigger = [_pub(message=[{"tou": "high"}]), _pub()]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert "message value is str, expected float" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("reply", "message"),
+    [
+        pytest.param({"success": False, "error": "no price config"}, "failed: no price config", id="failed"),
+        pytest.param({"success": True, "result": "24"}, "result is str, expected int", id="wrong-type"),
+    ],
+)
+def test_a_failed_trigger_fails_and_waits_for_no_frame(
+    tmp_path: Path, bus: _BusServer, reply: dict[str, Any], message: str
+) -> None:
+    bus.trigger_reply = reply
+    bus.on_trigger = [_pub()]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert message in result.stderr, result.stderr
+    assert result.stderr.startswith("probe failed: ")
+
+
+@pytest.mark.parametrize(
+    ("select", "message"),
+    [
+        pytest.param([0, "price"], 'select path [0, "price"] not found', id="missing-key"),
+        pytest.param([5, "tou"], 'select path [5, "tou"] not found', id="index-out-of-range"),
+        pytest.param(["tou"], 'select path ["tou"] not found', id="key-on-a-list"),
+    ],
+)
+def test_a_select_path_that_does_not_exist_fails_naming_the_path(
+    tmp_path: Path, bus: _BusServer, select: list[Any], message: str
+) -> None:
+    bus.on_trigger = [_pub()]
+    result = _topic_probe(tmp_path, bus, {**TOPIC_PROBE, "select": select})
+    assert result.returncode == 1
+    assert message in result.stderr, result.stderr
+
+
+def test_a_selected_value_of_the_wrong_type_fails(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_pub()]
+    result = _topic_probe(tmp_path, bus, {**TOPIC_PROBE, "expect": {"type": "str"}})
+    assert result.returncode == 1
+    assert "message value is float, expected str" in result.stderr
+
+
+def test_an_empty_select_checks_the_whole_message(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_pub()]
+    probe = {k: v for k, v in TOPIC_PROBE.items() if k != "select"}
+    result = _topic_probe(tmp_path, bus, {**probe, "expect": {"type": "list", "min_length": 2}})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("list length 2")
+
+
+def test_a_refused_monitor_id_fails_naming_the_status_and_makes_no_call(tmp_path: Path, bus: _BusServer) -> None:
+    bus.refuse = True
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert "was refused (HTTP 409): monitor is already connected" in result.stderr, result.stderr
+    assert bus.rpcs == []
+
+
+def test_a_handshake_whose_accept_key_is_wrong_is_refused(tmp_path: Path, bus: _BusServer) -> None:
+    bus.bad_accept = True
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert "Sec-WebSocket-Accept does not match" in result.stderr
+    assert bus.rpcs == []
+
+
+def test_a_fragmented_message_is_joined_and_a_ping_is_answered(tmp_path: Path, bus: _BusServer) -> None:
+    whole = _pub()
+    payload = whole[2:] if whole[1] < 126 else whole[4:]
+    half = len(payload) // 2
+    bus.on_trigger = [
+        _frame(b"ping-data", opcode=0x9),
+        _frame(payload[:half], opcode=1, fin=False),
+        _frame(b"mid-pong", opcode=0xA),
+        _frame(payload[half:], opcode=0, fin=True),
+    ]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 0, result.stderr
+    assert bus.monitor_done.wait(5)
+    assert (0xA, b"ping-data") in bus.client_frames
+
+
+def test_a_server_close_ends_the_probe_with_a_named_failure(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_frame(struct.pack("!H", 1008) + b"monitor too slow", opcode=0x8)]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert "monitor closed by the server" in result.stderr
+
+
+def test_a_masked_server_frame_is_a_protocol_failure(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_frame({"x": 1}, masked=True)]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert "monitor sent a masked frame" in result.stderr
+
+
+def test_an_oversize_frame_is_refused_without_reading_it(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [bytes([0x81, 127]) + struct.pack("!Q", 1 << 30)]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert "over the" in result.stderr and "byte cap" in result.stderr
+
+
+def test_a_monitor_that_cannot_be_reached_fails_naming_the_url(tmp_path: Path) -> None:
+    url = _closed_port_url()
+    result = _probe(_write_probe(tmp_path, TOPIC_PROBE), url)
+    assert result.returncode == 1
+    assert f"monitor could not reach {url}" in result.stderr
+
+
+def _without(key: str) -> dict[str, Any]:
+    return {k: v for k, v in TOPIC_PROBE.items() if k != key}
+
+
+@pytest.mark.parametrize(
+    ("probe", "message"),
+    [
+        pytest.param(_without("topic"), "missing a string 'topic'", id="no-topic"),
+        pytest.param(_without("within_s"), "'within_s' must be a positive number", id="no-within"),
+        pytest.param({**TOPIC_PROBE, "within_s": 0}, "'within_s' must be a positive number", id="zero-within"),
+        pytest.param({**TOPIC_PROBE, "within_s": True}, "'within_s' must be a positive number", id="bool-within"),
+        pytest.param(_without("expect"), "missing an object 'expect'", id="no-expect"),
+        pytest.param({**TOPIC_PROBE, "select": "tou"}, "'select' must be a list of keys and indexes", id="select-type"),
+        pytest.param(
+            {**TOPIC_PROBE, "select": [1.5]}, "'select' must be a list of keys and indexes", id="select-float"
+        ),
+        pytest.param({**TOPIC_PROBE, "prefix": "devices/"}, "unknown probe keys ['prefix']", id="old-prefix-key"),
+        pytest.param({**TOPIC_PROBE, "trigger": []}, "'trigger' must be an object", id="trigger-type"),
+        pytest.param(
+            {**TOPIC_PROBE, "trigger": {"expect": {"type": "int"}}}, "'trigger.method'", id="trigger-no-method"
+        ),
+        pytest.param(
+            {**TOPIC_PROBE, "trigger": {"method": "m"}}, "missing an object 'trigger.expect'", id="trigger-no-expect"
+        ),
+        pytest.param(
+            {**TOPIC_PROBE, "trigger": {"method": "m", "expect": {"type": "int"}, "x": 1}},
+            "unknown trigger keys ['x']",
+            id="trigger-key",
+        ),
+    ],
+)
+def test_a_malformed_topic_probe_fails_before_any_connection(
+    tmp_path: Path, bus: _BusServer, probe: Any, message: str
+) -> None:
+    result = _topic_probe(tmp_path, bus, probe)
+    assert result.returncode == 1
+    assert message in result.stderr, result.stderr
+    assert bus.events == []
+
+
+def test_the_interpreter_imports_only_the_standard_library() -> None:
+    tree = ast.parse(INTERPRETER.read_text(encoding="utf-8"))
+    imported = {
+        alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+    } | {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+    assert imported, "the scan found no imports"
+    assert imported <= set(sys.stdlib_module_names) | {"__future__"}, imported
