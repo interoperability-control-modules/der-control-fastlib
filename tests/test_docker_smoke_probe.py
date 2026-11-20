@@ -571,12 +571,14 @@ def _frame(payload: Any, opcode: int = 1, fin: bool = True, masked: bool = False
     mask_bit = 0x80 if masked else 0
     if len(data) < 126:
         head += bytes([mask_bit | len(data)])
-    else:
+    elif len(data) < 1 << 16:
         head += bytes([mask_bit | 126]) + struct.pack("!H", len(data))
+    else:
+        head += bytes([mask_bit | 127]) + struct.pack("!Q", len(data))
     return head + (b"\0\0\0\0" if masked else b"") + data
 
 
-def _pub(topic: str = TOPIC, sender: str = SENDER, message: Any = PRICE_MESSAGE) -> bytes:
+def _pub(topic: str = TOPIC, sender: str = SENDER, message: Any = PRICE_MESSAGE, opcode: int = 1) -> bytes:
     return _frame(
         {
             "type": "pubsub_message",
@@ -585,7 +587,8 @@ def _pub(topic: str = TOPIC, sender: str = SENDER, message: Any = PRICE_MESSAGE)
             "sender": sender,
             "headers": {},
             "message": message,
-        }
+        },
+        opcode=opcode,
     )
 
 
@@ -604,6 +607,17 @@ class _BusServer:
         self.handshakes: list[dict[str, str]] = []
         self.monitor_done = threading.Event()
         self._monitor_files: list[Any] = []
+        # Written verbatim in place of the 101 reply, then the connection closes.
+        self.handshake_wire: bytes | None = None
+        # Holds the handshake reply back until `release` is set or 5 s pass.
+        self.stall = False
+        self.release = threading.Event()
+        # Pause between a refusal's headers and its body, so they arrive apart.
+        self.refuse_pause = 0.0
+        # "drop" closes the TCP connection with no close frame; "reset" sends an RST
+        # once the first RPC has been answered, so the client has read the handshake.
+        self.after_handshake = ""
+        self.rpc_answered = threading.Event()
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802 - http.server API
@@ -615,6 +629,7 @@ class _BusServer:
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()
+                outer.rpc_answered.set()
                 for wfile in outer._monitor_files:
                     for wire in outer.on_trigger:
                         wfile.write(wire)
@@ -623,11 +638,20 @@ class _BusServer:
             def do_GET(self) -> None:  # noqa: N802 - http.server API
                 outer.events.append(("monitor", self.path))
                 outer.handshakes.append({k.lower(): v for k, v in self.headers.items()})
+                if outer.stall:
+                    outer.release.wait(5)
+                    return
+                if outer.handshake_wire is not None:
+                    self.wfile.write(outer.handshake_wire)
+                    return
                 if outer.refuse:
                     body = b"monitor is already connected"
                     self.send_response(409)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
+                    self.wfile.flush()
+                    if outer.refuse_pause:
+                        threading.Event().wait(outer.refuse_pause)
                     self.wfile.write(body)
                     outer.monitor_done.set()
                     return
@@ -645,6 +669,15 @@ class _BusServer:
                     self.wfile.write(wire)
                 self.wfile.flush()
                 try:
+                    if outer.after_handshake == "drop":
+                        return
+                    if outer.after_handshake == "reset":
+                        outer.rpc_answered.wait(5)
+                        # Linger 0 makes the close an RST rather than a FIN.
+                        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                        self.rfile.close()
+                        self.connection.close()
+                        return
                     while True:
                         head = self.rfile.read(2)
                         if len(head) < 2:
@@ -684,6 +717,7 @@ def bus() -> Iterator[_BusServer]:
     try:
         yield server
     finally:
+        server.release.set()
         server.server.shutdown()
         server.thread.join(timeout=5)
         server.server.server_close()
@@ -727,6 +761,13 @@ def test_each_monitor_id_is_unique_to_its_run(tmp_path: Path, bus: _BusServer) -
         assert _topic_probe(tmp_path, bus, probe).returncode == 0
     ids = [path for kind, path in bus.events if kind == "monitor"]
     assert len(ids) == 2 and ids[0] != ids[1]
+    # Each part is pinned: the pid separates concurrent probes, the token separates
+    # two runs that happen to share a pid.
+    parts = [re.fullmatch(rf"/monitor/smoke-{re.escape(SENDER)}-(\d+)-([0-9a-f]{{8}})", path) for path in ids]
+    assert all(parts), ids
+    first, second = (match.groups() for match in parts if match)
+    assert first[0] != second[0], ids
+    assert first[1] != second[1], ids
 
 
 def test_a_topic_with_no_publish_fails_at_within_s(tmp_path: Path, bus: _BusServer) -> None:
@@ -817,6 +858,8 @@ def test_an_empty_select_checks_the_whole_message(tmp_path: Path, bus: _BusServe
 
 def test_a_refused_monitor_id_fails_naming_the_status_and_makes_no_call(tmp_path: Path, bus: _BusServer) -> None:
     bus.refuse = True
+    # The body trails the headers, so the excerpt must be read from a later segment.
+    bus.refuse_pause = 0.3
     result = _topic_probe(tmp_path, bus)
     assert result.returncode == 1
     assert "was refused (HTTP 409): monitor is already connected" in result.stderr, result.stderr
@@ -873,6 +916,126 @@ def test_a_monitor_that_cannot_be_reached_fails_naming_the_url(tmp_path: Path) -
     result = _probe(_write_probe(tmp_path, TOPIC_PROBE), url)
     assert result.returncode == 1
     assert f"monitor could not reach {url}" in result.stderr
+
+
+def test_a_topic_probe_gives_up_at_within_s_not_at_the_overall_timeout(tmp_path: Path, bus: _BusServer) -> None:
+    within = 0.3
+    start = time.monotonic()
+    result = _probe(_write_probe(tmp_path, {**TOPIC_PROBE, "within_s": within}), bus.url, "--timeout", "20")
+    elapsed = time.monotonic() - start
+    assert result.returncode == 1
+    assert result.stderr.strip() == f"probe failed: no frame on {TOPIC} from {SENDER} within {within}s"
+    # Far under --timeout; the slack only absorbs interpreter start-up.
+    assert elapsed < within + 5, elapsed
+
+
+def _reserved_bits() -> bytes:
+    wire = _frame({"x": 1})
+    return bytes([wire[0] | 0x40]) + wire[1:]
+
+
+@pytest.mark.parametrize(
+    ("frames", "message"),
+    [
+        pytest.param([_reserved_bits()], "monitor sent a frame with reserved bits set", id="reserved-bits"),
+        pytest.param(
+            [_frame(b"abc", opcode=0)],
+            "monitor sent a continuation frame with nothing to continue",
+            id="bad-continuation",
+        ),
+        pytest.param(
+            [_frame(b"{", opcode=1, fin=False), _frame(b"{", opcode=1)],
+            "monitor started a new message inside a fragmented one",
+            id="interleaved",
+        ),
+        pytest.param([_frame(b"", opcode=3)], "monitor sent an unknown frame opcode 3", id="unknown-opcode"),
+        pytest.param(
+            [_frame(b"x" * 600_000, opcode=1, fin=False), _frame(b"x" * 600_000, opcode=0)],
+            "monitor message is over the 1048576-byte cap",
+            id="joined-size-cap",
+        ),
+    ],
+)
+def test_a_malformed_monitor_frame_fails_with_its_named_reason(
+    tmp_path: Path, bus: _BusServer, frames: list[bytes], message: str
+) -> None:
+    bus.on_trigger = frames
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert result.stderr.strip() == f"probe failed: {message}", result.stderr
+
+
+def test_a_binary_message_is_skipped_even_when_it_holds_the_matching_frame(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_pub(opcode=2)]
+    result = _topic_probe(tmp_path, bus, {**TOPIC_PROBE, "within_s": 0.5})
+    assert result.returncode == 1
+    assert result.stderr.strip() == f"probe failed: no frame on {TOPIC} from {SENDER} within 0.5s"
+
+
+def test_a_text_message_after_a_binary_one_still_decides(tmp_path: Path, bus: _BusServer) -> None:
+    bus.on_trigger = [_pub(opcode=2), _pub()]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [pytest.param(b"not json at all", id="non-json"), pytest.param(["a", "list"], id="non-object")],
+)
+def test_a_frame_that_is_not_a_json_object_is_skipped(tmp_path: Path, bus: _BusServer, junk: Any) -> None:
+    bus.on_trigger = [_frame(junk), _pub()]
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_tcp_drop_with_no_close_frame_is_a_connection_failure_not_a_missing_frame(
+    tmp_path: Path, bus: _BusServer
+) -> None:
+    bus.after_handshake = "drop"
+    probe = {k: v for k, v in TOPIC_PROBE.items() if k != "trigger"}
+    result = _topic_probe(tmp_path, bus, probe)
+    assert result.returncode == 1
+    assert result.stderr.strip() == "probe failed: monitor connection closed by the server", result.stderr
+
+
+def test_a_connection_reset_mid_read_is_a_named_probe_failure_not_a_traceback(tmp_path: Path, bus: _BusServer) -> None:
+    bus.after_handshake = "reset"
+    result = _topic_probe(tmp_path, bus)
+    assert result.returncode == 1
+    assert result.stderr.startswith("probe failed: monitor connection failed: "), result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("wire", "message"),
+    [
+        pytest.param(b"garbage", "monitor handshake got a broken reply: 'garbage'", id="early-end-of-stream"),
+        pytest.param(b"HTTP/1.1 abc Nope\r\n\r\n", "got a broken reply: 'HTTP/1.1 abc Nope'", id="non-numeric-status"),
+        pytest.param(b"HTTP/1.1\r\n\r\n", "got a broken reply: 'HTTP/1.1'", id="no-status-code"),
+        pytest.param(b"x" * 20000, "monitor handshake reply is too large", id="reply-too-large"),
+    ],
+)
+def test_a_broken_handshake_reply_fails_with_its_named_reason_and_makes_no_call(
+    tmp_path: Path, bus: _BusServer, wire: bytes, message: str
+) -> None:
+    bus.handshake_wire = wire
+    start = time.monotonic()
+    result = _probe(_write_probe(tmp_path, TOPIC_PROBE), bus.url, "--timeout", "10")
+    elapsed = time.monotonic() - start
+    assert result.returncode == 1
+    assert message in result.stderr, result.stderr
+    assert "timed out" not in result.stderr
+    # An end of stream must end the read at once, not run it out to --timeout.
+    assert elapsed < 8, elapsed
+    assert bus.rpcs == []
+
+
+def test_a_handshake_that_never_answers_times_out_by_name_and_makes_no_call(tmp_path: Path, bus: _BusServer) -> None:
+    bus.stall = True
+    result = _probe(_write_probe(tmp_path, TOPIC_PROBE), bus.url, "--timeout", "1")
+    assert result.returncode == 1
+    assert result.stderr.strip() == "probe failed: monitor handshake timed out after 1s", result.stderr
+    assert bus.rpcs == []
 
 
 def _without(key: str) -> dict[str, Any]:
