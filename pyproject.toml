@@ -24,14 +24,14 @@ classifiers = [
 # Here's how to specify dependencies in pyproject.toml format:
 dependencies = [
     "colorama~=0.4.6",
-    "fastapi>=0.141.1,<0.142.0",
-    "uvicorn>=0.38,<0.54",
+    "fastapi>=0.141.1,<0.163.0",
+    "uvicorn>=0.38,<0.55",
     "websocket-client~=1.9.0",
     "websockets>=15.0.1,<16.2.0",
     "gevent>=25.9.1,<26.10.0",
     "httpx~=0.28.1",
-    "pydantic>=2.12.3,<2.14.0",
-    "pydantic_core>=2.41.4,<2.50.0",
+    "pydantic>=2.12.3,<2.15.0",
+    "pydantic_core>=2.41.4,<2.51.0",
     "PyJWT>=2.13.0,<3",
     "python-multipart~=0.0.12",
     "PyYAML==6.0.3",
