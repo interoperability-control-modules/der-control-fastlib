@@ -81,7 +81,6 @@ historians = [
 # Dependencies for PlatformDriverAgent device interfaces
 # These are optional and only needed when using specific hardware drivers
 drivers = [
-    "bacpypes>=0.16.7",        # For PlatformDriverAgent BACnet driver interface
     "pymodbus>=2.5.3",         # For PlatformDriverAgent Modbus driver interface
     "modbus-tk>=1.1.2",        # For PlatformDriverAgent Modbus TK driver interface
     "pyserial>=3.5",           # For PlatformDriverAgent serial communication (Modbus)
@@ -169,7 +168,6 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "unit: marks tests as unit tests",
-    "bacnet: marks tests that require BACnet device or network (deselect with '-m \"not bacnet\"')",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
