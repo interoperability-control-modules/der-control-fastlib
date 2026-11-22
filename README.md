@@ -57,7 +57,7 @@ pip install -e ".[historians,drivers,ilc]"
   - `python-dateutil`, `ply`
   - Optional database drivers: MySQL, PostgreSQL, MQTT
 - **drivers**: Required for PlatformDriverAgent with hardware interfaces
-  - `bacpypes`, `pymodbus`, `modbus-tk`, `pyserial`
+  - `pymodbus`, `modbus-tk`, `pyserial`
 - **ilc**: Required for ILCAgent (demand response control)
   - `sympy` (symbolic math), `transitions` (state machines)
 
